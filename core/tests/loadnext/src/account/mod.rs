@@ -1,18 +1,19 @@
-use futures::{channel::mpsc, SinkExt};
 use std::{
     collections::VecDeque,
     sync::Arc,
     time::{Duration, Instant},
 };
+
+use futures::{channel::mpsc, SinkExt};
+use rand::Rng;
 use tokio::sync::RwLock;
-
-use zksync::{error::ClientError, operations::SyncTransactionHandle, HttpClient};
+use zksync_test_contracts::LoadnextContractExecutionParams;
 use zksync_types::{api::TransactionReceipt, Address, Nonce, H256, U256, U64};
-use zksync_web3_decl::jsonrpsee::core::Error as CoreError;
+use zksync_web3_decl::{
+    client::{Client, L2},
+    jsonrpsee::core::ClientError as CoreError,
+};
 
-use zksync_contracts::test_contracts::LoadnextContractExecutionParams;
-
-use crate::utils::format_gwei;
 use crate::{
     account::tx_command_executor::SubmitResult,
     account_pool::{AddressPool, TestWallet},
@@ -20,6 +21,8 @@ use crate::{
     config::{LoadtestConfig, RequestLimiters},
     constants::{MAX_L1_TRANSACTIONS, POLLING_INTERVAL},
     report::{Report, ReportBuilder, ReportLabel},
+    sdk::{error::ClientError, operations::SyncTransactionHandle},
+    utils::format_gwei,
 };
 
 mod api_request_executor;
@@ -59,7 +62,7 @@ pub struct AccountLifespan {
     contract_execution_params: LoadnextContractExecutionParams,
     /// Pool of account addresses, used to generate commands.
     addresses: AddressPool,
-    /// Successful transactions, required for requesting api
+    /// Successful transactions, required for requesting API
     successfully_sent_txs: Arc<RwLock<Vec<H256>>>,
     /// L1 ERC-20 token used in the test.
     main_l1_token: Address,
@@ -73,6 +76,8 @@ pub struct AccountLifespan {
     inflight_txs: VecDeque<InflightTx>,
     /// Current account nonce, it is None at the beginning and will be set after the first transaction
     current_nonce: Option<Nonce>,
+    /// Randomly assigned polling interval.
+    polling_interval: Duration,
 }
 
 impl AccountLifespan {
@@ -80,11 +85,12 @@ impl AccountLifespan {
         config: &LoadtestConfig,
         contract_execution_params: LoadnextContractExecutionParams,
         addresses: AddressPool,
-        test_account: TestWallet,
+        mut test_account: TestWallet,
         report_sink: mpsc::Sender<Report>,
         main_l2_token: Address,
         paymaster_address: Address,
     ) -> Self {
+        let polling_interval = test_account.rng.gen_range(POLLING_INTERVAL);
         Self {
             wallet: test_account,
             config: config.clone(),
@@ -97,6 +103,7 @@ impl AccountLifespan {
             report_sink,
             inflight_txs: Default::default(),
             current_nonce: None,
+            polling_interval,
         }
     }
 
@@ -130,14 +137,14 @@ impl AccountLifespan {
         self.execute_command(deploy_command.clone()).await?;
         self.wait_for_all_inflight_tx().await?;
 
-        let mut timer = tokio::time::interval(POLLING_INTERVAL);
+        let mut timer = tokio::time::interval(self.polling_interval);
         let mut l1_tx_count = 0;
         loop {
             let command = self.generate_command();
             let is_l1_transaction =
                 matches!(command.command_type, TxType::L1Execute | TxType::Deposit);
             if is_l1_transaction && l1_tx_count >= MAX_L1_TRANSACTIONS {
-                continue; // Skip command to not run out of ethereum on L1
+                continue; // Skip command to not run out of Ethereum on L1
             }
 
             // The new transaction should be sent only if mempool is not full
@@ -155,7 +162,7 @@ impl AccountLifespan {
     }
 
     async fn wait_for_all_inflight_tx(&mut self) -> Result<(), Aborted> {
-        let mut timer = tokio::time::interval(POLLING_INTERVAL);
+        let mut timer = tokio::time::interval(self.polling_interval);
         while !self.inflight_txs.is_empty() {
             timer.tick().await;
             self.check_inflight_txs().await?;
@@ -222,7 +229,7 @@ impl AccountLifespan {
         expected_outcome: &ExpectedOutcome,
     ) -> ReportLabel {
         match expected_outcome {
-            ExpectedOutcome::TxSucceed if transaction_receipt.status == Some(U64::one()) => {
+            ExpectedOutcome::TxSucceed if transaction_receipt.status == U64::one() => {
                 // If it was a successful `DeployContract` transaction, set the contract
                 // address for subsequent usage by `Execute`.
                 if let Some(address) = transaction_receipt.contract_address {
@@ -233,7 +240,7 @@ impl AccountLifespan {
                 // Transaction succeed and it should have.
                 ReportLabel::done()
             }
-            ExpectedOutcome::TxRejected if transaction_receipt.status == Some(U64::zero()) => {
+            ExpectedOutcome::TxRejected if transaction_receipt.status == U64::zero() => {
                 // Transaction failed and it should have.
                 ReportLabel::done()
             }
@@ -352,7 +359,7 @@ impl AccountLifespan {
         }
     }
 
-    /// Generic submitter for zkSync network: it can operate individual transactions,
+    /// Generic submitter for ZKsync network: it can operate individual transactions,
     /// as long as we can provide a `SyncTransactionHandle` to wait for the commitment and the
     /// execution result.
     /// Once result is obtained, it's compared to the expected operation outcome in order to check whether
@@ -360,7 +367,7 @@ impl AccountLifespan {
     async fn submit(
         &mut self,
         modifier: IncorrectnessModifier,
-        send_result: Result<SyncTransactionHandle<'_, HttpClient>, ClientError>,
+        send_result: Result<SyncTransactionHandle<'_, Client<L2>>, ClientError>,
     ) -> Result<SubmitResult, ClientError> {
         let expected_outcome = modifier.expected_outcome();
 

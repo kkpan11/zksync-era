@@ -1,40 +1,142 @@
+###################################################################################################
+#
+# see `README.md` in `etc/nix`
+#
+###################################################################################################
 {
-    description = "zkSync development shell";
-    inputs = {
-        stable.url = "github:NixOS/nixpkgs/nixos-22.11";
+  description = "ZKsync-era";
+
+  nixConfig = {
+    extra-substituters = [ "https://attic.teepot.org/tee-pot" ];
+    extra-trusted-public-keys = [ "tee-pot:SS6HcrpG87S1M6HZGPsfo7d1xJccCGev7/tXc5+I4jg=" ];
+  };
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05";
+    teepot-flake.url = "github:matter-labs/teepot";
+    nixsgx-flake.url = "github:matter-labs/nixsgx";
+    flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    crane = {
+      url = "github:ipetkov/crane?tag=v0.17.3";
+      inputs.nixpkgs.follows = "nixpkgs";
     };
-    outputs = {self, stable}: {
-        packages.x86_64-linux.default =
-        with import stable { system = "x86_64-linux"; };
-        pkgs.mkShell {
-            name = "zkSync";
-            src = ./.;
-            buildInputs = [
-                docker-compose
-                nodejs
-                yarn
-                axel
-                libclang
-                openssl
-                pkg-config
-                postgresql
-                python3
-                solc
+  };
+
+  outputs = { self, nixpkgs, teepot-flake, nixsgx-flake, flake-utils, rust-overlay, crane }:
+    let
+      officialRelease = false;
+      hardeningEnable = [ "fortify3" "pie" "relro" ];
+
+      out = system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [
+              rust-overlay.overlays.default
+              nixsgx-flake.overlays.default
+              teepot-flake.overlays.default
+            ];
+          };
+
+          appliedOverlay = self.overlays.default pkgs pkgs;
+        in
+        {
+          formatter = pkgs.nixpkgs-fmt;
+
+          packages = {
+            # to ease potential cross-compilation, the overlay is used
+            inherit (appliedOverlay.zksync-era) zksync tee_prover container-tee-prover-azure container-tee-prover-dcap;
+            default = appliedOverlay.zksync-era.tee_prover;
+          };
+
+          devShells.default = appliedOverlay.zksync-era.devShell;
+        };
+    in
+    flake-utils.lib.eachDefaultSystem out // {
+      overlays.default = final: prev:
+        # to ease potential cross-compilation, the overlay is used
+        let
+          pkgs = final;
+
+          rustVersion = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain;
+
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rustVersion;
+            rustc = rustVersion;
+          };
+
+          craneLib = (crane.mkLib pkgs).overrideToolchain rustVersion;
+
+          commonArgs = {
+            nativeBuildInputs = with pkgs;[
+              pkg-config
+              rustPlatform.bindgenHook
             ];
 
-            # for RocksDB and other Rust bindgen libraries
-            LIBCLANG_PATH = lib.makeLibraryPath [ libclang.lib ];
-            BINDGEN_EXTRA_CLANG_ARGS = ''-I"${libclang.lib}/lib/clang/${libclang.version}/include"'';
+            buildInputs = with pkgs;[
+              libclang.dev
+              openssl.dev
+              snappy.dev
+              lz4.dev
+              bzip2.dev
+              rocksdb
+              snappy.dev
+            ];
 
-            shellHook = ''
-                export ZKSYNC_HOME=$PWD
-                export PATH=$ZKSYNC_HOME/bin:$PATH
-            '';
+            src = with pkgs.lib.fileset; toSource {
+              root = ./.;
+              fileset = unions [
+                ./Cargo.lock
+                ./Cargo.toml
+                ./core
+                ./prover
+                ./zkstack_cli
+                ./.github/release-please/manifest.json
+              ];
+            };
 
-            # hardhat solc requires ld-linux
-            # Nixos has to fake it with nix-ld
-            NIX_LD_LIBRARY_PATH = lib.makeLibraryPath [];
-            NIX_LD = builtins.readFile "${stdenv.cc}/nix-support/dynamic-linker";
+            env = {
+              OPENSSL_NO_VENDOR = "1";
+              ROCKSDB_LIB_DIR = "${pkgs.rocksdb.out}/lib";
+              SNAPPY_LIB_DIR = "${pkgs.snappy.out}/lib";
+              NIX_OUTPATH_USED_AS_RANDOM_SEED = "aaaaaaaaaa";
+            };
+
+            doCheck = false;
+            strictDeps = true;
+            inherit hardeningEnable;
+          };
+        in
+        {
+          zksync-era = rec {
+            devShell = pkgs.callPackage ./etc/nix/devshell.nix {
+              inherit zksync;
+              inherit commonArgs;
+            };
+
+            zksync = pkgs.callPackage ./etc/nix/zksync.nix {
+              inherit craneLib;
+              inherit commonArgs;
+            };
+
+            tee_prover = pkgs.callPackage ./etc/nix/tee_prover.nix {
+              inherit craneLib;
+              inherit commonArgs;
+            };
+
+            container-tee-prover-azure = pkgs.callPackage ./etc/nix/container-tee_prover.nix {
+              inherit tee_prover;
+              isAzure = true;
+              container-name = "zksync-tee-prover-azure";
+            };
+            container-tee-prover-dcap = pkgs.callPackage ./etc/nix/container-tee_prover.nix {
+              inherit tee_prover;
+              isAzure = false;
+              container-name = "zksync-tee-prover-dcap";
+            };
+          };
         };
     };
 }
+

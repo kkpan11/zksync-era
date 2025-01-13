@@ -6,9 +6,8 @@ use serde::{
     Deserialize, Serialize,
 };
 
-use crate::{Address, Bytes};
-
 pub use crate::Execute as ExecuteData;
+use crate::{web3::Bytes, Address};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "codeFormat", content = "sourceCode")]
@@ -138,11 +137,15 @@ pub struct VerificationIncomingRequest {
     #[serde(flatten)]
     pub compiler_versions: CompilerVersions,
     pub optimization_used: bool,
+    /// Optimization mode used for the contract. Semantics depends on the compiler used; e.g., for `vyper`,
+    /// allowed values are `gas` (default), `codesize` or `none`.
     pub optimizer_mode: Option<String>,
     #[serde(default)]
     pub constructor_arguments: Bytes,
-    #[serde(default)]
+    #[serde(default, alias = "enableEraVMExtensions")]
     pub is_system: bool,
+    #[serde(default)]
+    pub force_evmla: bool,
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
@@ -151,17 +154,19 @@ pub enum CompilerType {
     Vyper,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CompilerVersions {
     #[serde(rename_all = "camelCase")]
     Solc {
-        compiler_zksolc_version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compiler_zksolc_version: Option<String>,
         compiler_solc_version: String,
     },
     #[serde(rename_all = "camelCase")]
     Vyper {
-        compiler_zkvyper_version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compiler_zkvyper_version: Option<String>,
         compiler_vyper_version: String,
     },
 }
@@ -174,29 +179,29 @@ impl CompilerVersions {
         }
     }
 
-    pub fn zk_compiler_version(&self) -> String {
+    pub fn zk_compiler_version(&self) -> Option<&str> {
         match self {
-            CompilerVersions::Solc {
+            Self::Solc {
                 compiler_zksolc_version,
                 ..
-            } => compiler_zksolc_version.clone(),
-            CompilerVersions::Vyper {
+            } => compiler_zksolc_version.as_deref(),
+            Self::Vyper {
                 compiler_zkvyper_version,
                 ..
-            } => compiler_zkvyper_version.clone(),
+            } => compiler_zkvyper_version.as_deref(),
         }
     }
 
-    pub fn compiler_version(&self) -> String {
+    pub fn compiler_version(&self) -> &str {
         match self {
-            CompilerVersions::Solc {
+            Self::Solc {
                 compiler_solc_version,
                 ..
-            } => compiler_solc_version.clone(),
-            CompilerVersions::Vyper {
+            } => compiler_solc_version,
+            Self::Vyper {
                 compiler_vyper_version,
                 ..
-            } => compiler_vyper_version.clone(),
+            } => compiler_vyper_version,
         }
     }
 }
@@ -212,8 +217,19 @@ pub struct VerificationRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompilationArtifacts {
+    /// In case of EVM contracts, this is the creation bytecode (`bytecode` in `solc` output).
     pub bytecode: Vec<u8>,
+    /// Deployed bytecode (`deployedBytecode` in `solc` output). Only set for EVM contracts; for EraVM contracts, the deployed bytecode
+    /// is always `bytecode` (i.e., there's no distinction between creation and deployed bytecodes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployed_bytecode: Option<Vec<u8>>,
     pub abi: serde_json::Value,
+}
+
+impl CompilationArtifacts {
+    pub fn deployed_bytecode(&self) -> &[u8] {
+        self.deployed_bytecode.as_deref().unwrap_or(&self.bytecode)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,40 +250,33 @@ pub struct VerificationRequestStatus {
     pub compilation_errors: Option<Vec<String>>,
 }
 
-#[derive(Debug)]
-pub enum DeployContractCalldata {
-    Deploy(Vec<u8>),
-    Ignore,
-}
-
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
+
     use super::SourceCodeData;
 
     #[test]
     fn source_code_deserialization() {
         let single_file_str = r#"{"codeFormat": "solidity-single-file", "sourceCode": "text"}"#;
         let single_file_result = serde_json::from_str::<SourceCodeData>(single_file_str);
-        assert!(matches!(
-            single_file_result,
-            Ok(SourceCodeData::SolSingleFile(_))
-        ));
+        assert_matches!(single_file_result, Ok(SourceCodeData::SolSingleFile(_)));
 
         let stand_json_input_str =
             r#"{"codeFormat": "solidity-standard-json-input", "sourceCode": {}}"#;
         let stand_json_input_result = serde_json::from_str::<SourceCodeData>(stand_json_input_str);
-        assert!(matches!(
+        assert_matches!(
             stand_json_input_result,
             Ok(SourceCodeData::StandardJsonInput(_))
-        ));
+        );
 
         let type_not_specified_str = r#"{"sourceCode": "text"}"#;
         let type_not_specified_result =
             serde_json::from_str::<SourceCodeData>(type_not_specified_str);
-        assert!(matches!(
+        assert_matches!(
             type_not_specified_result,
             Ok(SourceCodeData::SolSingleFile(_))
-        ));
+        );
 
         let type_not_specified_object_str = r#"{"sourceCode": {}}"#;
         let type_not_specified_object_result =

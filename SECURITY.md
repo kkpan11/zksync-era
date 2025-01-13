@@ -5,7 +5,7 @@ We truly appreciate efforts to discover and disclose security issues responsibly
 ## Vulnerabilities
 
 If you'd like to report a security issue in the repositories of matter-labs organization, please proceed to our
-[Bug Bounty Program on Immunefi](https://era.zksync.io/docs/reference/troubleshooting/audit-bug-bounty.html#bug-bounty-program).
+[Bug Bounty Program on Immunefi](https://docs.zksync.io/build/resources/audit-bug-bounty#bug-bounty-program).
 
 ## Other Security Issues
 
@@ -19,7 +19,7 @@ The following PGP key may be used to communicate sensitive information to develo
 
 Fingerprint: `5FED B2D0 EA2C 4906 DD66 71D7 A2C5 0B40 CE3C F297`
 
-```
+```text
 -----BEGIN PGP PUBLIC KEY BLOCK-----
 
 mQINBGEBmQkBEAD6tlkBEZFMvR8kOgxXX857nC2+oTik6TopJz4uCskuqDaeldMy
