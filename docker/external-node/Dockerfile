@@ -1,32 +1,37 @@
-# For using private GitHub dependencies, CI downdloads all crates outside of the contatiner
-# Not expected to work locally
+# Will work locally only after prior contracts build
 
-# syntax=docker/dockerfile:experimental
-FROM rust:1.72-bookworm as builder
-RUN apt-get update && apt-get install -y clang && rm -rf /var/lib/apt/lists/*
+FROM ghcr.io/matter-labs/zksync-build-base:latest AS builder
+
+# set of args for use of sccache
+ARG SCCACHE_GCS_BUCKET=""
+ARG SCCACHE_GCS_SERVICE_ACCOUNT=""
+ARG SCCACHE_GCS_RW_MODE=""
+ARG RUSTC_WRAPPER=""
+
+ENV SCCACHE_GCS_BUCKET=${SCCACHE_GCS_BUCKET}
+ENV SCCACHE_GCS_SERVICE_ACCOUNT=${SCCACHE_GCS_SERVICE_ACCOUNT}
+ENV SCCACHE_GCS_RW_MODE=${SCCACHE_GCS_RW_MODE}
+ENV RUSTC_WRAPPER=${RUSTC_WRAPPER}
+
 WORKDIR /usr/src/zksync
 COPY . .
+RUN cargo build --manifest-path ./core/Cargo.toml --release --bin zksync_external_node --bin block_reverter
 
-RUN CARGO_HOME=./cargo cargo build --release
-RUN CARGO_HOME=./cargo cargo install sqlx-cli --version 0.5.13
+FROM ghcr.io/matter-labs/zksync-runtime-base:latest
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y curl libpq5 ca-certificates && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /usr/src/zksync/target/release/zksync_external_node /usr/bin
-COPY --from=builder /usr/src/zksync/target/release/block_reverter /usr/bin
-COPY --from=builder /usr/src/zksync/cargo/bin/sqlx /usr/bin
+COPY --from=builder /usr/src/zksync/core/target/release/zksync_external_node /usr/bin
+COPY --from=builder /usr/src/zksync/core/target/release/block_reverter /usr/bin
+COPY --from=builder /usr/local/cargo/bin/sqlx /usr/bin
 COPY --from=builder /usr/src/zksync/docker/external-node/entrypoint.sh /usr/bin
-RUN chmod +x /usr/bin/entrypoint.sh
-COPY etc/system-contracts/bootloader/build/artifacts/ /etc/system-contracts/bootloader/build/artifacts/
-COPY etc/system-contracts/contracts/artifacts/ /etc/system-contracts/contracts/artifacts/
-COPY etc/system-contracts/contracts/precompiles/artifacts/ /etc/system-contracts/contracts/precompiles/artifacts/
-COPY etc/system-contracts/artifacts-zk /etc/system-contracts/artifacts-zk
-COPY contracts/ethereum/artifacts/ /contracts/ethereum/artifacts/
-COPY contracts/zksync/artifacts-zk/ /contracts/zksync/artifacts-zk/
+COPY contracts/system-contracts/zkout/ /contracts/system-contracts/zkout/
+COPY contracts/l1-contracts/out/ /contracts/l1-contracts/out/
+COPY contracts/l1-contracts/zkout/ /contracts/l1-contracts/zkout/
+COPY contracts/l2-contracts/zkout/ /contracts/l2-contracts/zkout/
 COPY etc/tokens/ /etc/tokens/
 COPY etc/ERC20/ /etc/ERC20/
 COPY etc/multivm_bootloaders/ /etc/multivm_bootloaders/
 COPY core/lib/dal/migrations/ /migrations
+
+RUN chmod +x /usr/bin/entrypoint.sh
 
 ENTRYPOINT [ "sh", "/usr/bin/entrypoint.sh"]

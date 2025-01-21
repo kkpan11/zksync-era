@@ -1,58 +1,73 @@
-use super::envy_load;
-use serde::Deserialize;
 use std::time::Duration;
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
-pub enum ProtocolVersionLoadingMode {
-    FromDb,
-    FromEnvVar,
+use serde::Deserialize;
+use zksync_basic_types::L1BatchNumber;
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct TeeConfig {
+    /// If true, the TEE support is enabled.
+    pub tee_support: bool,
+    /// All batches before this one are considered to be processed.
+    pub first_tee_processed_batch: L1BatchNumber,
+    /// Timeout in seconds for retrying the preparation of input for TEE proof generation if it
+    /// previously failed (e.g., due to a transient network issue) or if it was picked by a TEE
+    /// prover but the TEE proof was not submitted within that time.
+    pub tee_proof_generation_timeout_in_secs: u16,
+    /// Timeout in hours after which a batch will be permanently ignored if repeated retries failed.
+    pub tee_batch_permanently_ignored_timeout_in_hours: u16,
+}
+
+impl Default for TeeConfig {
+    fn default() -> Self {
+        TeeConfig {
+            tee_support: Self::default_tee_support(),
+            first_tee_processed_batch: Self::default_first_tee_processed_batch(),
+            tee_proof_generation_timeout_in_secs:
+                Self::default_tee_proof_generation_timeout_in_secs(),
+            tee_batch_permanently_ignored_timeout_in_hours:
+                Self::default_tee_batch_permanently_ignored_timeout_in_hours(),
+        }
+    }
+}
+
+impl TeeConfig {
+    pub fn default_tee_support() -> bool {
+        false
+    }
+
+    pub fn default_first_tee_processed_batch() -> L1BatchNumber {
+        L1BatchNumber(0)
+    }
+
+    pub fn default_tee_proof_generation_timeout_in_secs() -> u16 {
+        60
+    }
+
+    pub fn default_tee_batch_permanently_ignored_timeout_in_hours() -> u16 {
+        10 * 24
+    }
+
+    pub fn tee_proof_generation_timeout(&self) -> Duration {
+        Duration::from_secs(self.tee_proof_generation_timeout_in_secs.into())
+    }
+
+    pub fn tee_batch_permanently_ignored_timeout(&self) -> Duration {
+        Duration::from_secs(3600 * u64::from(self.tee_batch_permanently_ignored_timeout_in_hours))
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 pub struct ProofDataHandlerConfig {
     pub http_port: u16,
     pub proof_generation_timeout_in_secs: u16,
-    pub protocol_version_loading_mode: ProtocolVersionLoadingMode,
-    pub fri_protocol_version_id: u16,
+    #[serde(skip)]
+    // ^ Filled in separately in `Self::from_env()`. We cannot use `serde(flatten)` because it
+    // doesn't work with `envy`: https://github.com/softprops/envy/issues/26
+    pub tee_config: TeeConfig,
 }
 
 impl ProofDataHandlerConfig {
-    pub fn from_env() -> anyhow::Result<Self> {
-        envy_load("proof_data_handler", "PROOF_DATA_HANDLER_")
-    }
-
     pub fn proof_generation_timeout(&self) -> Duration {
         Duration::from_secs(self.proof_generation_timeout_in_secs as u64)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::configs::test_utils::EnvMutex;
-
-    static MUTEX: EnvMutex = EnvMutex::new();
-
-    fn expected_config() -> ProofDataHandlerConfig {
-        ProofDataHandlerConfig {
-            http_port: 3320,
-            proof_generation_timeout_in_secs: 18000,
-            protocol_version_loading_mode: ProtocolVersionLoadingMode::FromEnvVar,
-            fri_protocol_version_id: 2,
-        }
-    }
-
-    #[test]
-    fn from_env() {
-        let config = r#"
-            PROOF_DATA_HANDLER_PROOF_GENERATION_TIMEOUT_IN_SECS="18000"
-            PROOF_DATA_HANDLER_HTTP_PORT="3320"
-            PROOF_DATA_HANDLER_PROTOCOL_VERSION_LOADING_MODE="FromEnvVar"
-            PROOF_DATA_HANDLER_FRI_PROTOCOL_VERSION_ID="2"
-        "#;
-        let mut lock = MUTEX.lock();
-        lock.set_env(config);
-        let actual = ProofDataHandlerConfig::from_env().unwrap();
-        assert_eq!(actual, expected_config());
     }
 }

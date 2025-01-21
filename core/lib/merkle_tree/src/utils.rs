@@ -63,6 +63,13 @@ impl<V> SmallMap<V> {
         Self::indices(self.bitmap).zip(&self.values)
     }
 
+    pub fn last(&self) -> Option<(u8, &V)> {
+        let greatest_set_bit = (u16::BITS - self.bitmap.leading_zeros()).checked_sub(1)?;
+        let greatest_set_bit = u8::try_from(greatest_set_bit).unwrap();
+        // ^ `unwrap()` is safe by construction: `greatest_set_bit <= 15`.
+        Some((greatest_set_bit, self.values.last()?))
+    }
+
     fn indices(bitmap: u16) -> impl Iterator<Item = u8> {
         (0..Self::CAPACITY).filter(move |&index| {
             let mask = 1 << u16::from(index);
@@ -72,6 +79,11 @@ impl<V> SmallMap<V> {
 
     pub fn values(&self) -> impl Iterator<Item = &V> + '_ {
         self.values.iter()
+    }
+
+    #[cfg(test)]
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut V> + '_ {
+        self.values.iter_mut()
     }
 
     pub fn get_mut(&mut self, index: u8) -> Option<&mut V> {
@@ -100,11 +112,6 @@ impl<V> SmallMap<V> {
             self.values[index] = value;
         }
     }
-}
-
-pub(crate) fn increment_counter(counter: &mut u64) -> u64 {
-    *counter += 1;
-    *counter
 }
 
 pub(crate) fn find_diverging_bit(lhs: Key, rhs: Key) -> usize {
@@ -157,6 +164,49 @@ impl<T> Iterator for MergingIter<T> {
 }
 
 impl<T> ExactSizeIterator for MergingIter<T> {}
+
+#[cfg(test)]
+pub(crate) mod testonly {
+    use crate::{Key, MerkleTree, PruneDatabase, TreeEntry, ValueHash};
+
+    pub(crate) fn setup_tree_with_stale_keys(db: impl PruneDatabase, incorrect_truncation: bool) {
+        let mut tree = MerkleTree::new(db).unwrap();
+        let kvs: Vec<_> = (0_u64..100)
+            .map(|i| TreeEntry::new(Key::from(i), i + 1, ValueHash::zero()))
+            .collect();
+        tree.extend(kvs).unwrap();
+
+        let overridden_kvs = vec![TreeEntry::new(
+            Key::from(0),
+            1,
+            ValueHash::repeat_byte(0xaa),
+        )];
+        tree.extend(overridden_kvs).unwrap();
+
+        let stale_keys = tree.db.stale_keys(1);
+        assert!(
+            stale_keys.iter().any(|key| !key.is_empty()),
+            "{stale_keys:?}"
+        );
+
+        // Revert `overridden_kvs`.
+        if incorrect_truncation {
+            tree.truncate_recent_versions_incorrectly(1).unwrap();
+        } else {
+            tree.truncate_recent_versions(1).unwrap();
+        }
+        assert_eq!(tree.latest_version(), Some(0));
+        let future_stale_keys = tree.db.stale_keys(1);
+        assert_eq!(future_stale_keys.is_empty(), !incorrect_truncation);
+
+        // Add a new version without the key. To make the matter more egregious, the inserted key
+        // differs from all existing keys, starting from the first nibble.
+        let new_key = Key::from_big_endian(&[0xaa; 32]);
+        let new_kvs = vec![TreeEntry::new(new_key, 101, ValueHash::repeat_byte(0xaa))];
+        tree.extend(new_kvs).unwrap();
+        assert_eq!(tree.latest_version(), Some(1));
+    }
+}
 
 #[cfg(test)]
 mod tests {

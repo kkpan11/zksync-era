@@ -1,11 +1,6 @@
-use anyhow::Context as _;
+use std::{error, fmt};
+
 use async_trait::async_trait;
-
-use std::{error, fmt, sync::Arc};
-
-use crate::{file::FileBackedObjectStore, gcs::GoogleCloudStorage, mock::MockStore};
-use zksync_config::configs::object_store::ObjectStoreMode;
-use zksync_config::ObjectStoreConfig;
 
 /// Bucket for [`ObjectStore`] in which objects can be placed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -21,6 +16,10 @@ pub enum Bucket {
     NodeAggregationWitnessJobsFri,
     SchedulerWitnessJobsFri,
     ProofsFri,
+    ProofsTee,
+    StorageSnapshot,
+    DataAvailability,
+    VmDumps,
 }
 
 impl Bucket {
@@ -36,6 +35,10 @@ impl Bucket {
             Self::NodeAggregationWitnessJobsFri => "node_aggregation_witness_jobs_fri",
             Self::SchedulerWitnessJobsFri => "scheduler_witness_jobs_fri",
             Self::ProofsFri => "proofs_fri",
+            Self::ProofsTee => "proofs_tee",
+            Self::StorageSnapshot => "storage_logs_snapshots",
+            Self::DataAvailability => "data_availability",
+            Self::VmDumps => "vm_dumps",
         }
     }
 }
@@ -51,21 +54,58 @@ pub type BoxedError = Box<dyn error::Error + Send + Sync>;
 
 /// Errors during [`ObjectStore`] operations.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ObjectStoreError {
+    /// Object store initialization failed.
+    Initialization {
+        source: BoxedError,
+        is_retriable: bool,
+    },
     /// An object with the specified key is not found.
     KeyNotFound(BoxedError),
     /// Object (de)serialization failed.
     Serialization(BoxedError),
     /// Other error has occurred when accessing the store (e.g., a network error).
-    Other(BoxedError),
+    Other {
+        source: BoxedError,
+        is_retriable: bool,
+    },
+}
+
+impl ObjectStoreError {
+    /// Gives a best-effort estimate whether this error is retriable.
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            Self::Initialization { is_retriable, .. } | Self::Other { is_retriable, .. } => {
+                *is_retriable
+            }
+            Self::KeyNotFound(_) | Self::Serialization(_) => false,
+        }
+    }
 }
 
 impl fmt::Display for ObjectStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Initialization {
+                source,
+                is_retriable,
+            } => {
+                let kind = if *is_retriable { "retriable" } else { "fatal" };
+                write!(
+                    formatter,
+                    "{kind} error initializing object store: {source}"
+                )
+            }
             Self::KeyNotFound(err) => write!(formatter, "key not found: {err}"),
             Self::Serialization(err) => write!(formatter, "serialization error: {err}"),
-            Self::Other(err) => write!(formatter, "other error: {err}"),
+            Self::Other {
+                source,
+                is_retriable,
+            } => {
+                let kind = if *is_retriable { "retriable" } else { "fatal" };
+                write!(formatter, "{kind} error accessing object store: {source}")
+            }
         }
     }
 }
@@ -73,9 +113,10 @@ impl fmt::Display for ObjectStoreError {
 impl error::Error for ObjectStoreError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            Self::KeyNotFound(err) | Self::Serialization(err) | Self::Other(err) => {
-                Some(err.as_ref())
+            Self::Initialization { source, .. } | Self::Other { source, .. } => {
+                Some(source.as_ref())
             }
+            Self::KeyNotFound(err) | Self::Serialization(err) => Some(err.as_ref()),
         }
     }
 }
@@ -88,7 +129,7 @@ impl error::Error for ObjectStoreError {
 ///
 /// [`StoredObject`]: crate::StoredObject
 #[async_trait]
-pub trait ObjectStore: fmt::Debug + Send + Sync {
+pub trait ObjectStore: 'static + fmt::Debug + Send + Sync {
     /// Fetches the value for the given key from the given bucket if it exists.
     ///
     /// # Errors
@@ -115,125 +156,6 @@ pub trait ObjectStore: fmt::Debug + Send + Sync {
     ///
     /// Returns an error if removal fails.
     async fn remove_raw(&self, bucket: Bucket, key: &str) -> Result<(), ObjectStoreError>;
-}
 
-#[async_trait]
-impl<T: ObjectStore + ?Sized> ObjectStore for Arc<T> {
-    async fn get_raw(&self, bucket: Bucket, key: &str) -> Result<Vec<u8>, ObjectStoreError> {
-        (**self).get_raw(bucket, key).await
-    }
-
-    async fn put_raw(
-        &self,
-        bucket: Bucket,
-        key: &str,
-        value: Vec<u8>,
-    ) -> Result<(), ObjectStoreError> {
-        (**self).put_raw(bucket, key, value).await
-    }
-
-    async fn remove_raw(&self, bucket: Bucket, key: &str) -> Result<(), ObjectStoreError> {
-        (**self).remove_raw(bucket, key).await
-    }
-}
-
-#[derive(Debug)]
-enum ObjectStoreOrigin {
-    Config(ObjectStoreConfig),
-    Mock(Arc<MockStore>),
-}
-
-/// Factory of [`ObjectStore`]s.
-#[derive(Debug)]
-pub struct ObjectStoreFactory {
-    origin: ObjectStoreOrigin,
-}
-
-impl ObjectStoreFactory {
-    /// Creates an object store factory based on the provided `config`.
-    ///
-    /// # Panics
-    ///
-    /// If the GCS-backed implementation is configured, this constructor will panic if called
-    /// outside the Tokio runtime.
-    pub fn new(config: ObjectStoreConfig) -> Self {
-        Self {
-            origin: ObjectStoreOrigin::Config(config),
-        }
-    }
-
-    /// Creates an object store factory with the configuration taken from the environment.
-    ///
-    /// # Errors
-    ///
-    /// Invalid or missing configuration.
-    pub fn from_env() -> anyhow::Result<Self> {
-        Ok(Self::new(
-            ObjectStoreConfig::from_env().context("ObjectStoreConfig::from_env()")?,
-        ))
-    }
-
-    /// Creates an object store factory with the prover configuration taken from the environment.
-    ///
-    /// # Errors
-    ///
-    /// Invalid or missing configuration.
-    pub fn prover_from_env() -> anyhow::Result<Self> {
-        Ok(Self::new(
-            ObjectStoreConfig::prover_from_env().context("ObjectStoreConfig::prover_from_env()")?,
-        ))
-    }
-
-    /// Creates an object store factory with a mock in-memory store.
-    /// All calls to [`Self::create_store()`] will return the same store; thus, the testing code
-    /// can use [`ObjectStore`] methods for assertions.
-    pub fn mock() -> Self {
-        Self {
-            origin: ObjectStoreOrigin::Mock(Arc::new(MockStore::default())),
-        }
-    }
-
-    /// Creates an [`ObjectStore`].
-    pub async fn create_store(&self) -> Box<dyn ObjectStore> {
-        match &self.origin {
-            ObjectStoreOrigin::Config(config) => Self::create_from_config(config).await,
-            ObjectStoreOrigin::Mock(store) => Box::new(Arc::clone(store)),
-        }
-    }
-
-    async fn create_from_config(config: &ObjectStoreConfig) -> Box<dyn ObjectStore> {
-        let gcs_credential_file_path = match config.mode {
-            ObjectStoreMode::GCSWithCredentialFile => Some(config.gcs_credential_file_path.clone()),
-            _ => None,
-        };
-        match config.mode {
-            ObjectStoreMode::GCS => {
-                tracing::trace!(
-                    "Initialized GoogleCloudStorage Object store without credential file"
-                );
-                let store = GoogleCloudStorage::new(
-                    gcs_credential_file_path,
-                    config.bucket_base_url.clone(),
-                    config.max_retries,
-                )
-                .await;
-                Box::new(store)
-            }
-            ObjectStoreMode::GCSWithCredentialFile => {
-                tracing::trace!("Initialized GoogleCloudStorage Object store with credential file");
-                let store = GoogleCloudStorage::new(
-                    gcs_credential_file_path,
-                    config.bucket_base_url.clone(),
-                    config.max_retries,
-                )
-                .await;
-                Box::new(store)
-            }
-            ObjectStoreMode::FileBacked => {
-                tracing::trace!("Initialized FileBacked Object store");
-                let store = FileBackedObjectStore::new(config.file_backed_base_path.clone()).await;
-                Box::new(store)
-            }
-        }
-    }
+    fn storage_prefix_raw(&self, bucket: Bucket) -> String;
 }

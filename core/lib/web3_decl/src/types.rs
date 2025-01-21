@@ -3,30 +3,23 @@
 //! Most of the types are re-exported from the `web3` crate, but some of them maybe extended with
 //! new variants (enums) or optional fields (structures).
 //!
-//! These "extensions" are required to provide more zkSync-specific information while remaining Web3-compilant.
+//! These "extensions" are required to provide more ZKsync-specific information while remaining Web3-compilant.
 
 use core::convert::{TryFrom, TryInto};
-use core::fmt;
-use core::marker::PhantomData;
 
-use chrono::NaiveDateTime;
-use itertools::unfold;
 use rlp::Rlp;
-use serde::{de, Deserialize, Serialize, Serializer};
-
+use serde::{Deserialize, Serialize};
 pub use zksync_types::{
     api::{Block, BlockNumber, Log, TransactionReceipt, TransactionRequest},
-    vm_trace::{ContractSourceDebugInfo, VmDebugTrace, VmExecutionStep},
+    ethabi,
     web3::{
-        ethabi,
-        types::{
-            Address, BlockHeader, Bytes, CallRequest, FeeHistory, Index, SyncState, TraceFilter,
-            Transaction, Work, H160, H256, H64, U256, U64,
-        },
+        BlockHeader, Bytes, CallRequest, FeeHistory, Index, SyncState, TraceFilter, U64Number,
+        ValueOrArray, Work,
     },
+    Address, Transaction, H160, H256, H64, U256, U64,
 };
 
-/// Token in the zkSync network
+/// Token in the ZKsync network
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Token {
@@ -105,72 +98,6 @@ pub enum FilterChanges {
     Empty([u8; 0]),
 }
 
-/// Represents all kinds of `Filter`.
-#[derive(Debug, Clone)]
-pub enum TypedFilter {
-    Events(Filter, zksync_types::MiniblockNumber),
-    Blocks(zksync_types::MiniblockNumber),
-    PendingTransactions(NaiveDateTime),
-}
-
-/// Either value or array of values.
-#[derive(Default, Debug, PartialEq, Clone)]
-pub struct ValueOrArray<T>(pub Vec<T>);
-
-impl<T> Serialize for ValueOrArray<T>
-where
-    T: Serialize,
-{
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self.0.len() {
-            0 => serializer.serialize_none(),
-            1 => Serialize::serialize(&self.0[0], serializer),
-            _ => Serialize::serialize(&self.0, serializer),
-        }
-    }
-}
-
-impl<'de, T: std::fmt::Debug + Deserialize<'de>> ::serde::Deserialize<'de> for ValueOrArray<T> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: ::serde::Deserializer<'de>,
-    {
-        struct Visitor<T>(PhantomData<T>);
-
-        impl<'de, T: std::fmt::Debug + Deserialize<'de>> de::Visitor<'de> for Visitor<T> {
-            type Value = ValueOrArray<T>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("Expected value or sequence")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                use serde::de::IntoDeserializer;
-
-                Deserialize::deserialize(value.into_deserializer())
-                    .map(|value| ValueOrArray(vec![value]))
-            }
-
-            fn visit_seq<S>(self, visitor: S) -> Result<Self::Value, S::Error>
-            where
-                S: de::SeqAccess<'de>,
-            {
-                unfold(visitor, |vis| vis.next_element().transpose())
-                    .collect::<Result<_, _>>()
-                    .map(ValueOrArray)
-            }
-        }
-
-        deserializer.deserialize_any(Visitor(PhantomData))
-    }
-}
-
 /// Filter
 #[derive(Default, Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct Filter {
@@ -188,6 +115,28 @@ pub struct Filter {
     pub topics: Option<Vec<Option<ValueOrArray<H256>>>>,
     #[serde(rename = "blockHash", skip_serializing_if = "Option::is_none")]
     pub block_hash: Option<H256>,
+}
+
+impl From<zksync_types::web3::Filter> for Filter {
+    fn from(value: zksync_types::web3::Filter) -> Self {
+        let convert_block_number = |b: zksync_types::web3::BlockNumber| match b {
+            zksync_types::web3::BlockNumber::Finalized => BlockNumber::Finalized,
+            zksync_types::web3::BlockNumber::Safe => BlockNumber::Finalized,
+            zksync_types::web3::BlockNumber::Latest => BlockNumber::Latest,
+            zksync_types::web3::BlockNumber::Earliest => BlockNumber::Earliest,
+            zksync_types::web3::BlockNumber::Pending => BlockNumber::Pending,
+            zksync_types::web3::BlockNumber::Number(n) => BlockNumber::Number(n),
+        };
+        let from_block = value.from_block.map(convert_block_number);
+        let to_block = value.to_block.map(convert_block_number);
+        Filter {
+            from_block,
+            to_block,
+            address: value.address,
+            topics: value.topics,
+            block_hash: value.block_hash,
+        }
+    }
 }
 
 /// Filter Builder
@@ -352,8 +301,9 @@ pub enum PubSubResult {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use zksync_types::api::{BlockId, BlockIdVariant};
+
+    use super::*;
 
     #[test]
     fn get_block_number_serde() {
@@ -416,5 +366,31 @@ mod tests {
             let actual_block_id: BlockId = deserialized.into();
             assert_eq!(&actual_block_id, expected_block_id);
         }
+    }
+
+    #[test]
+    fn serializing_value_or_array() {
+        let value = ValueOrArray::from(Address::repeat_byte(0x1f));
+        let json = serde_json::to_value(value.clone()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!("0x1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f")
+        );
+
+        let restored_value: ValueOrArray<Address> = serde_json::from_value(json).unwrap();
+        assert_eq!(restored_value, value);
+
+        let value = ValueOrArray(vec![Address::repeat_byte(0x1f), Address::repeat_byte(0x23)]);
+        let json = serde_json::to_value(value.clone()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                "0x1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f",
+                "0x2323232323232323232323232323232323232323",
+            ])
+        );
+
+        let restored_value: ValueOrArray<Address> = serde_json::from_value(json).unwrap();
+        assert_eq!(restored_value, value);
     }
 }
