@@ -1,7 +1,7 @@
+use std::fmt::Debug;
+
 use async_trait::async_trait;
 use tokio::{fs, io};
-
-use std::fmt::Debug;
 
 use crate::raw::{Bucket, ObjectStore, ObjectStoreError};
 
@@ -9,18 +9,27 @@ impl From<io::Error> for ObjectStoreError {
     fn from(err: io::Error) -> Self {
         match err.kind() {
             io::ErrorKind::NotFound => ObjectStoreError::KeyNotFound(err.into()),
-            _ => ObjectStoreError::Other(err.into()),
+            kind => ObjectStoreError::Other {
+                is_retriable: matches!(kind, io::ErrorKind::Interrupted | io::ErrorKind::TimedOut),
+                source: err.into(),
+            },
         }
     }
 }
 
+/// [`ObjectStore`] implementation storing objects as files in a local filesystem. Mostly useful for local testing.
 #[derive(Debug)]
-pub(crate) struct FileBackedObjectStore {
+pub struct FileBackedObjectStore {
     base_dir: String,
 }
 
 impl FileBackedObjectStore {
-    pub async fn new(base_dir: String) -> Self {
+    /// Creates a new file-backed store with its root at the specified path.
+    ///
+    /// # Errors
+    ///
+    /// Propagates I/O errors.
+    pub async fn new(base_dir: String) -> Result<Self, ObjectStoreError> {
         for bucket in &[
             Bucket::ProverJobs,
             Bucket::WitnessInput,
@@ -32,15 +41,13 @@ impl FileBackedObjectStore {
             Bucket::NodeAggregationWitnessJobsFri,
             Bucket::SchedulerWitnessJobsFri,
             Bucket::ProofsFri,
+            Bucket::StorageSnapshot,
+            Bucket::VmDumps,
         ] {
             let bucket_path = format!("{base_dir}/{bucket}");
-            fs::create_dir_all(&bucket_path)
-                .await
-                .unwrap_or_else(|err| {
-                    panic!("failed creating bucket `{bucket_path}`: {err}");
-                });
+            fs::create_dir_all(&bucket_path).await?;
         }
-        FileBackedObjectStore { base_dir }
+        Ok(FileBackedObjectStore { base_dir })
     }
 
     fn filename(&self, bucket: Bucket, key: &str) -> String {
@@ -69,24 +76,28 @@ impl ObjectStore for FileBackedObjectStore {
         let filename = self.filename(bucket, key);
         fs::remove_file(filename).await.map_err(From::from)
     }
+
+    fn storage_prefix_raw(&self, bucket: Bucket) -> String {
+        format!("{}/{}", self.base_dir, bucket)
+    }
 }
 
 #[cfg(test)]
 mod test {
-    use tempdir::TempDir;
+    use tempfile::TempDir;
 
     use super::*;
 
     #[tokio::test]
     async fn test_get() {
-        let dir = TempDir::new("test-data").unwrap();
+        let dir = TempDir::new().unwrap();
         let path = dir.into_path().into_os_string().into_string().unwrap();
-        let object_store = FileBackedObjectStore::new(path).await;
+        let object_store = FileBackedObjectStore::new(path).await.unwrap();
         let expected = vec![9, 0, 8, 9, 0, 7];
-        let result = object_store
+        object_store
             .put_raw(Bucket::ProverJobs, "test-key.bin", expected.clone())
-            .await;
-        assert!(result.is_ok(), "result must be OK");
+            .await
+            .unwrap();
         let bytes = object_store
             .get_raw(Bucket::ProverJobs, "test-key.bin")
             .await
@@ -96,28 +107,28 @@ mod test {
 
     #[tokio::test]
     async fn test_put() {
-        let dir = TempDir::new("test-data").unwrap();
+        let dir = TempDir::new().unwrap();
         let path = dir.into_path().into_os_string().into_string().unwrap();
-        let object_store = FileBackedObjectStore::new(path).await;
+        let object_store = FileBackedObjectStore::new(path).await.unwrap();
         let bytes = vec![9, 0, 8, 9, 0, 7];
-        let result = object_store
+        object_store
             .put_raw(Bucket::ProverJobs, "test-key.bin", bytes)
-            .await;
-        assert!(result.is_ok(), "result must be OK");
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn test_remove() {
-        let dir = TempDir::new("test-data").unwrap();
+        let dir = TempDir::new().unwrap();
         let path = dir.into_path().into_os_string().into_string().unwrap();
-        let object_store = FileBackedObjectStore::new(path).await;
-        let result = object_store
+        let object_store = FileBackedObjectStore::new(path).await.unwrap();
+        object_store
             .put_raw(Bucket::ProverJobs, "test-key.bin", vec![0, 1])
-            .await;
-        assert!(result.is_ok(), "result must be OK");
-        let result = object_store
+            .await
+            .unwrap();
+        object_store
             .remove_raw(Bucket::ProverJobs, "test-key.bin")
-            .await;
-        assert!(result.is_ok(), "result must be OK");
+            .await
+            .unwrap();
     }
 }

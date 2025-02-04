@@ -1,30 +1,50 @@
-import { BigNumberish } from '@ethersproject/bignumber';
-import { BytesLike, ethers } from 'ethers';
-import { ForceDeployUpgraderFactory as ForceDeployUpgraderFactoryL2 } from 'l2-zksync-contracts/typechain';
-import { DefaultUpgradeFactory as DefaultUpgradeFactoryL1 } from 'l1-zksync-contracts/typechain';
-import { FacetCut } from 'l1-zksync-contracts/src.ts/diamondCut';
-import { IZkSyncFactory } from 'l1-zksync-contracts/typechain/IZkSyncFactory';
-import { ComplexUpgraderFactory } from '../../../etc/system-contracts/typechain';
+import { BytesLike, ethers, BigNumberish } from 'ethers';
+import { ForceDeployUpgraderFactory as ForceDeployUpgraderFactoryL2 } from 'l2-contracts/typechain';
+import {
+    DefaultUpgradeFactory as DefaultUpgradeFactoryL1,
+    AdminFacetFactory,
+    StateTransitionManagerFactory,
+    ChainAdminFactory
+} from 'l1-contracts/typechain';
+import { FacetCut } from 'l1-contracts/src.ts/diamondCut';
+import { ComplexUpgraderFactory } from 'system-contracts/typechain';
 import {
     getCommonDataFileName,
     getCryptoFileName,
     getFacetCutsFileName,
     getL2TransactionsFileName,
+    getPostUpgradeCalldataFileName,
     getL2UpgradeFileName,
-    VerifierParams
+    VerifierParams,
+    unpackStringSemVer,
+    packSemver
 } from './utils';
 import fs from 'fs';
 import { Command } from 'commander';
-import { web3Url } from 'zk/build/utils';
+import { web3Url } from 'utils';
 import * as path from 'path';
 
 const testConfigPath = path.join(process.env.ZKSYNC_HOME as string, `etc/test_config/constant`);
 const ethTestConfig = JSON.parse(fs.readFileSync(`${testConfigPath}/eth.json`, { encoding: 'utf-8' }));
 
-export interface TransparentUpgrade {
+export enum Action {
+    Add = 0,
+    Replace = 1,
+    Remove = 2
+}
+
+export interface DiamondCutData {
     facetCuts: FacetCut[];
     initAddress: string;
     initCalldata: string;
+}
+
+export interface ChainCreationParams {
+    genesisUpgrade: string;
+    genesisBatchHash: string;
+    genesisIndexRepeatedStorageChanges: number;
+    genesisBatchCommitment: string;
+    diamondCut: DiamondCutData;
 }
 
 export interface ForceDeployment {
@@ -56,7 +76,7 @@ export interface L2CanonicalTransaction {
     // is to be passed to account and any changes to its structure
     // would mean a breaking change to these accounts. In order to prevent this,
     // we should keep some fields as "reserved".
-    // It is also recommneded that their length is fixed, since
+    // It is also recommended that their length is fixed, since
     // it would allow easier proof integration (in case we will need
     // some special circuit for preprocessing transactions).
     reserved: [BigNumberish, BigNumberish, BigNumberish, BigNumberish];
@@ -81,7 +101,6 @@ export interface ProposedUpgrade {
     postUpgradeCalldata: BytesLike;
     upgradeTimestamp: ethers.BigNumber;
     newProtocolVersion: BigNumberish;
-    newAllowList: string;
 }
 
 function buildNoopL2UpgradeTx(): L2CanonicalTransaction {
@@ -115,10 +134,8 @@ export function buildProposeUpgrade(
     bootloaderHash?: BytesLike,
     defaultAccountHash?: BytesLike,
     verifier?: string,
-    newAllowList?: string,
     l2ProtocolUpgradeTx?: L2CanonicalTransaction
 ): ProposedUpgrade {
-    newAllowList = newAllowList ?? ethers.constants.AddressZero;
     bootloaderHash = bootloaderHash ?? ethers.constants.HashZero;
     defaultAccountHash = defaultAccountHash ?? ethers.constants.HashZero;
     l1ContractsUpgradeCalldata = l1ContractsUpgradeCalldata ?? '0x';
@@ -134,8 +151,7 @@ export function buildProposeUpgrade(
         postUpgradeCalldata,
         upgradeTimestamp,
         factoryDeps: [],
-        newProtocolVersion,
-        newAllowList
+        newProtocolVersion
     };
 }
 
@@ -163,43 +179,119 @@ export function prepareDefaultCalldataForL2upgrade(forcedDeployments: ForceDeplo
     return complexUpgraderCalldata;
 }
 
-export function prepareproposeTransparentUpgradeCalldata(
+function prepareChainAdminCalldata(target: string, data: BytesLike): string {
+    const call = {
+        target: target,
+        value: 0,
+        data: data
+    };
+
+    const chainAdmin = new ChainAdminFactory();
+    const calldata = chainAdmin.interface.encodeFunctionData('multicall', [[call], true]);
+
+    return calldata;
+}
+
+export function prepareUpgradeCalldata(
+    oldProtocolVersion,
+    oldProtocolVersionDeadline,
+    newProtocolVersion,
     initCalldata,
     upgradeAddress: string,
     facetCuts: FacetCut[],
-    diamondUpgradeProposalId: number
+    zksyncAddress: string,
+    genesisUpgradeAddress: string,
+    genesisBatchHash: string,
+    genesisIndexRepeatedStorageChanges: number,
+    genesisBatchCommitment: string,
+    prepareDirectOperation?: boolean,
+    chainId?: string
 ) {
-    let zkSyncFactory = IZkSyncFactory.connect(upgradeAddress, ethers.providers.getDefaultProvider());
-    let transparentUpgrade: TransparentUpgrade = {
+    let diamondCut: DiamondCutData = {
         facetCuts,
         initAddress: upgradeAddress,
         initCalldata
     };
 
-    let proposeTransparentUpgradeCalldata = zkSyncFactory.interface.encodeFunctionData('proposeTransparentUpgrade', [
-        transparentUpgrade,
-        diamondUpgradeProposalId
+    let chainCreationDiamondCut: DiamondCutData = {
+        facetCuts: facetCuts.filter((cut) => cut.action == Action.Add),
+        initAddress: genesisUpgradeAddress,
+        initCalldata: '0x'
+    };
+
+    let chainCreationParams: ChainCreationParams = {
+        genesisUpgrade: genesisUpgradeAddress,
+        genesisBatchHash,
+        genesisIndexRepeatedStorageChanges,
+        genesisBatchCommitment,
+        diamondCut: chainCreationDiamondCut
+    };
+
+    // Prepare calldata for STM
+    let stm = new StateTransitionManagerFactory();
+    const stmUpgradeCalldata = stm.interface.encodeFunctionData('setNewVersionUpgrade', [
+        diamondCut,
+        oldProtocolVersion,
+        oldProtocolVersionDeadline,
+        newProtocolVersion
     ]);
 
-    let executeUpgradeCalldata = zkSyncFactory.interface.encodeFunctionData('executeUpgrade', [
-        transparentUpgrade,
-        ethers.constants.HashZero
+    const stmSetChainCreationCalldata = stm.interface.encodeFunctionData('setChainCreationParams', [
+        chainCreationParams
     ]);
-    return [proposeTransparentUpgradeCalldata, executeUpgradeCalldata, transparentUpgrade];
+
+    // Prepare calldata for upgrading diamond proxy
+    let adminFacet = new AdminFacetFactory();
+    const diamondProxyUpgradeCalldata = adminFacet.interface.encodeFunctionData('upgradeChainFromVersion', [
+        oldProtocolVersion,
+        diamondCut
+    ]);
+
+    const chainAdminUpgradeCalldata = prepareChainAdminCalldata(zksyncAddress, diamondProxyUpgradeCalldata);
+
+    let result: any = {
+        stmUpgradeCalldata,
+        chainAdminUpgradeCalldata,
+        diamondCut,
+        stmSetChainCreationCalldata
+    };
+
+    if (prepareDirectOperation) {
+        if (!chainId) {
+            throw new Error('chainId is required for direct operation');
+        }
+
+        const stmDirecUpgradeCalldata = stm.interface.encodeFunctionData('executeUpgrade', [chainId, diamondCut]);
+
+        result = {
+            ...result,
+            stmDirecUpgradeCalldata
+        };
+    }
+
+    return result;
 }
 
 export function buildDefaultUpgradeTx(
     environment,
-    diamondUpgradeProposalId,
     upgradeAddress,
-    l2UpgraderAddress,
+    oldProtocolVersion,
+    oldProtocolVersionDeadline,
     upgradeTimestamp,
-    newAllowList
+    zksyncAddress,
+    postUpgradeCalldataFlag,
+    genesisUpgradeAddress,
+    genesisBatchHash,
+    genesisIndexRepeatedStorageChanges,
+    genesisBatchCommitment,
+    prepareDirectOperation?,
+    chainId?
 ) {
     const commonData = JSON.parse(fs.readFileSync(getCommonDataFileName(), { encoding: 'utf-8' }));
-    const protocolVersion = commonData.protocolVersion;
+    const newProtocolVersionSemVer: string = commonData.protocolVersion;
+    const packedNewProtocolVersion = packSemver(...unpackStringSemVer(newProtocolVersionSemVer));
     console.log(
-        `Building default upgrade tx for ${environment} protocol version ${protocolVersion} upgradeTimestamp ${upgradeTimestamp} `
+        `Building default upgrade tx for ${environment} protocol version ${newProtocolVersionSemVer} upgradeTimestamp ${upgradeTimestamp} `
     );
     let facetCuts = [];
     let facetCutsFileName = getFacetCutsFileName(environment);
@@ -246,71 +338,62 @@ export function buildDefaultUpgradeTx(
         }
     }
 
+    let postUpgradeCalldata = '0x';
+    let postUpgradeCalldataFileName = getPostUpgradeCalldataFileName(environment);
+    if (postUpgradeCalldataFlag) {
+        if (fs.existsSync(postUpgradeCalldataFileName)) {
+            console.log(`Found facet cuts file ${postUpgradeCalldataFileName}`);
+            postUpgradeCalldata = JSON.parse(fs.readFileSync(postUpgradeCalldataFileName).toString());
+        } else {
+            throw new Error(`Post upgrade calldata file ${postUpgradeCalldataFileName} not found`);
+        }
+    }
+
     let proposeUpgradeTx = buildProposeUpgrade(
         ethers.BigNumber.from(upgradeTimestamp),
-        protocolVersion,
+        packedNewProtocolVersion,
         '0x',
-        '0x',
+        postUpgradeCalldata,
         cryptoVerifierParams,
         bootloaderHash,
         defaultAAHash,
         cryptoVerifierAddress,
-        newAllowList,
         l2UpgradeTx
     );
 
     let l1upgradeCalldata = prepareDefaultCalldataForL1upgrade(proposeUpgradeTx);
 
-    let [proposeTransparentUpgradeCalldata, executeUpgradeCalldata, transparentUpgrade] =
-        prepareproposeTransparentUpgradeCalldata(
-            l1upgradeCalldata,
-            upgradeAddress,
-            facetCuts,
-            diamondUpgradeProposalId
-        );
+    let upgradeData = prepareUpgradeCalldata(
+        oldProtocolVersion,
+        oldProtocolVersionDeadline,
+        packedNewProtocolVersion,
+        l1upgradeCalldata,
+        upgradeAddress,
+        facetCuts,
+        zksyncAddress,
+        genesisUpgradeAddress,
+        genesisBatchHash,
+        genesisIndexRepeatedStorageChanges,
+        genesisBatchCommitment,
+        prepareDirectOperation,
+        chainId
+    );
+
     const transactions = {
         proposeUpgradeTx,
         l1upgradeCalldata,
         upgradeAddress,
-        protocolVersion,
-        diamondUpgradeProposalId,
+        protocolVersionSemVer: newProtocolVersionSemVer,
+        packedProtocolVersion: packedNewProtocolVersion,
         upgradeTimestamp,
-        proposeTransparentUpgradeCalldata,
-        transparentUpgrade,
-        executeUpgradeCalldata
+        ...upgradeData
     };
 
     fs.writeFileSync(getL2TransactionsFileName(environment), JSON.stringify(transactions, null, 2));
     console.log('Default upgrade transactions are generated');
 }
 
-async function sendTransaction(
-    calldata: BytesLike,
-    privateKey: string,
-    l1rpc: string,
-    zksyncAddress: string,
-    environment: string,
-    gasPrice: ethers.BigNumber,
-    nonce: number
-) {
-    const wallet = getWallet(l1rpc, privateKey);
-    zksyncAddress = zksyncAddress ?? process.env.CONTRACTS_DIAMOND_PROXY_ADDR;
-    gasPrice = gasPrice ?? (await wallet.provider.getGasPrice());
-    nonce = nonce ?? (await wallet.getTransactionCount());
-    const tx = await wallet.sendTransaction({
-        to: zksyncAddress,
-        data: calldata,
-        value: 0,
-        gasLimit: 10_000_000,
-        gasPrice,
-        nonce
-    });
-    console.log('Transaction hash: ', tx.hash);
-    await tx.wait();
-    console.log('Transaction is executed');
-}
-
-function getWallet(l1rpc, privateKey) {
+export function getWallet(l1rpc, privateKey) {
     if (!l1rpc) {
         l1rpc = web3Url();
     }
@@ -324,89 +407,6 @@ function getWallet(l1rpc, privateKey) {
           ).connect(provider);
 }
 
-async function proposeUpgrade(
-    privateKey: string,
-    l1rpc: string,
-    zksyncAddress: string,
-    environment: string,
-    gasPrice: ethers.BigNumber,
-    nonce: number
-) {
-    const transactions = JSON.parse(fs.readFileSync(getL2TransactionsFileName(environment)).toString());
-    const proposeTransparentUpgradeCalldata = transactions.proposeTransparentUpgradeCalldata;
-    console.log(`Proposing upgrade for protocolVersion ${transactions.protocolVersion}`);
-    await sendTransaction(
-        proposeTransparentUpgradeCalldata,
-        privateKey,
-        l1rpc,
-        zksyncAddress,
-        environment,
-        gasPrice,
-        nonce
-    );
-}
-
-async function executeUpgrade(
-    privateKey: string,
-    l1rpc: string,
-    zksyncAddress: string,
-    environment: string,
-    gasPrice: ethers.BigNumber,
-    nonce: number
-) {
-    const transactions = JSON.parse(fs.readFileSync(getL2TransactionsFileName(environment)).toString());
-    const executeUpgradeCalldata = transactions.executeUpgradeCalldata;
-    console.log(`Execute upgrade for protocolVersion ${transactions.protocolVersion}`);
-    await sendTransaction(executeUpgradeCalldata, privateKey, l1rpc, zksyncAddress, environment, gasPrice, nonce);
-}
-
-async function cancelUpgrade(
-    privateKey: string,
-    l1rpc: string,
-    zksyncAddress: string,
-    environment: string,
-    gasPrice: ethers.BigNumber,
-    nonce: number,
-    execute: boolean
-) {
-    zksyncAddress = zksyncAddress ?? process.env.CONTRACTS_DIAMOND_PROXY_ADDR;
-    let wallet = getWallet(l1rpc, privateKey);
-    let zkSync = IZkSyncFactory.connect(zksyncAddress, wallet);
-    const transactions = JSON.parse(fs.readFileSync(getL2TransactionsFileName(environment)).toString());
-
-    const transparentUpgrade = transactions.transparentUpgrade;
-    const diamondUpgradeProposalId = transactions.diamondUpgradeProposalId;
-
-    const proposalHash = await zkSync.upgradeProposalHash(
-        transparentUpgrade,
-        diamondUpgradeProposalId,
-        ethers.constants.HashZero
-    );
-
-    console.log(`Cancel upgrade with hash: ${proposalHash}`);
-    let cancelUpgradeCalldata = zkSync.interface.encodeFunctionData('cancelUpgradeProposal', [proposalHash]);
-    if (execute) {
-        await sendTransaction(cancelUpgradeCalldata, privateKey, l1rpc, zksyncAddress, environment, gasPrice, nonce);
-    } else {
-        console.log(`Cancel upgrade calldata: ${cancelUpgradeCalldata}`);
-    }
-}
-
-async function getNewDiamondUpgradeProposalId(l1rpc: string, zksyncAddress: string) {
-    zksyncAddress = zksyncAddress ?? process.env.CONTRACTS_DIAMOND_PROXY_ADDR;
-    // We don't care about the wallet here, we just need to make a get call.
-    let wallet = getWallet(l1rpc, undefined);
-    let zkSync = IZkSyncFactory.connect(zksyncAddress, wallet);
-    let proposalId = await zkSync.getCurrentProposalId();
-    proposalId = proposalId.add(1);
-    console.log(
-        `New proposal id: ${proposalId} for ${zksyncAddress} network: ${JSON.stringify(
-            await wallet.provider.getNetwork()
-        )}`
-    );
-    return proposalId;
-}
-
 export const command = new Command('transactions').description(
     'prepare the transactions and their calldata for the upgrade'
 );
@@ -416,82 +416,31 @@ command
     .requiredOption('--upgrade-timestamp <upgradeTimestamp>')
     .option('--upgrade-address <upgradeAddress>')
     .option('--environment <env>')
-    .option('--new-allow-list <newAllowList>')
-    .option('--l2-upgrader-address <l2UpgraderAddress>')
-    .option('--diamond-upgrade-proposal-id <diamondUpgradeProposalId>')
+    .option('--old-protocol-version <oldProtocolVersion>')
+    .option('--old-protocol-version-deadline <oldProtocolVersionDeadline>')
     .option('--l1rpc <l1prc>')
     .option('--zksync-address <zksyncAddress>')
+    .option('--chain-id <chainId>')
+    .option('--prepare-direct-operation <prepareDirectOperation>')
+    .option('--post-upgrade-calldata <postUpgradeCalldata>')
+    .option('--genesis-upgrade-address <genesisUpgradeAddress>')
+    .option('--genesis-batch-hash <genesisBatchHash>')
+    .option('--genesis-index-repeated-storage-changes <genesisIndexRepeatedStorageChanges>')
+    .option('--genesis-batch-commitment <genesisBatchCommitment>')
     .action(async (options) => {
-        let diamondUpgradeProposalId = options.diamondUpgradeProposalId;
-        if (!diamondUpgradeProposalId) {
-            diamondUpgradeProposalId = await getNewDiamondUpgradeProposalId(options.l1rpc, options.zksyncAddress);
-        }
-
         buildDefaultUpgradeTx(
             options.environment,
-            diamondUpgradeProposalId,
             options.upgradeAddress,
-            options.l2UpgraderAddress,
+            options.oldProtocolVersion,
+            options.oldProtocolVersionDeadline,
             options.upgradeTimestamp,
-            options.newAllowList
-        );
-    });
-
-command
-    .command('propose-upgrade')
-    .option('--environment <env>')
-    .option('--private-key <privateKey>')
-    .option('--zksync-address <zksyncAddress>')
-    .option('--gas-price <gasPrice>')
-    .option('--nonce <nonce>')
-    .option('--l1rpc <l1prc>')
-    .action(async (options) => {
-        await proposeUpgrade(
-            options.privateKey,
-            options.l1rpc,
             options.zksyncAddress,
-            options.environment,
-            options.gasPrice,
-            options.nonce
-        );
-    });
-
-command
-    .command('execute-upgrade')
-    .option('--environment <env>')
-    .option('--private-key <privateKey>')
-    .option('--zksync-address <zksyncAddress>')
-    .option('--gas-price <gasPrice>')
-    .option('--nonce <nonce>')
-    .option('--l1rpc <l1prc>')
-    .action(async (options) => {
-        await executeUpgrade(
-            options.privateKey,
-            options.l1rpc,
-            options.zksyncAddress,
-            options.environment,
-            options.gasPrice,
-            options.nonce
-        );
-    });
-
-command
-    .command('cancel-upgrade')
-    .option('--environment <env>')
-    .option('--private-key <privateKey>')
-    .option('--zksync-address <zksyncAddress>')
-    .option('--gas-price <gasPrice>')
-    .option('--nonce <nonce>')
-    .option('--l1rpc <l1prc>')
-    .option('--execute')
-    .action(async (options) => {
-        await cancelUpgrade(
-            options.privateKey,
-            options.l1rpc,
-            options.zksyncAddress,
-            options.environment,
-            options.gasPrice,
-            options.nonce,
-            options.execute
+            options.postUpgradeCalldata,
+            options.genesisUpgradeAddress,
+            options.genesisBatchHash,
+            options.genesisIndexRepeatedStorageChanges,
+            options.genesisBatchCommitment,
+            options.prepareDirectOperation,
+            options.chainId
         );
     });

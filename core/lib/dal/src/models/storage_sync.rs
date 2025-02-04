@@ -1,94 +1,145 @@
-use std::{convert::TryInto, str::FromStr};
-
-use sqlx::types::chrono::{DateTime, NaiveDateTime, Utc};
+use std::str::FromStr;
 
 use zksync_contracts::BaseSystemContractsHashes;
-use zksync_types::api::en::SyncBlock;
-use zksync_types::Transaction;
-use zksync_types::{Address, L1BatchNumber, MiniblockNumber, H256};
+use zksync_db_connection::error::SqlxContext;
+use zksync_types::{
+    api::en,
+    commitment::{PubdataParams, PubdataType},
+    parse_h160, parse_h256, parse_h256_opt, Address, L1BatchNumber, L2BlockNumber,
+    ProtocolVersionId, Transaction, H256,
+};
+
+use crate::{consensus_dal::Payload, models::parse_protocol_version};
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct StorageSyncBlock {
+pub(crate) struct StorageSyncBlock {
     pub number: i64,
     pub l1_batch_number: i64,
-    pub last_batch_miniblock: Option<i64>,
+    pub tx_count: i32,
     pub timestamp: i64,
-    pub root_hash: Option<Vec<u8>>,
-    pub commit_tx_hash: Option<String>,
-    pub committed_at: Option<NaiveDateTime>,
-    pub prove_tx_hash: Option<String>,
-    pub proven_at: Option<NaiveDateTime>,
-    pub execute_tx_hash: Option<String>,
-    pub executed_at: Option<NaiveDateTime>,
     // L1 gas price assumed in the corresponding batch
     pub l1_gas_price: i64,
     // L2 gas price assumed in the corresponding batch
     pub l2_fair_gas_price: i64,
+    pub fair_pubdata_price: Option<i64>,
     pub bootloader_code_hash: Option<Vec<u8>>,
     pub default_aa_code_hash: Option<Vec<u8>>,
-    pub fee_account_address: Option<Vec<u8>>, // May be None if the block is not yet sealed
+    pub evm_emulator_code_hash: Option<Vec<u8>>,
+    pub fee_account_address: Vec<u8>,
     pub protocol_version: i32,
     pub virtual_blocks: i64,
     pub hash: Vec<u8>,
+    pub l2_da_validator_address: Vec<u8>,
+    pub pubdata_type: String,
 }
 
-impl StorageSyncBlock {
-    pub(crate) fn into_sync_block(
-        self,
-        current_operator_address: Address,
-        transactions: Option<Vec<Transaction>>,
-    ) -> SyncBlock {
-        SyncBlock {
-            number: MiniblockNumber(self.number as u32),
-            l1_batch_number: L1BatchNumber(self.l1_batch_number as u32),
-            last_in_batch: self
-                .last_batch_miniblock
-                .map(|n| n == self.number)
-                .unwrap_or(false),
-            timestamp: self.timestamp as u64,
-            root_hash: self.root_hash.as_deref().map(H256::from_slice),
-            commit_tx_hash: self
-                .commit_tx_hash
-                .as_deref()
-                .map(|hash| H256::from_str(hash).expect("Incorrect commit_tx hash")),
-            committed_at: self
-                .committed_at
-                .map(|committed_at| DateTime::<Utc>::from_naive_utc_and_offset(committed_at, Utc)),
-            prove_tx_hash: self
-                .prove_tx_hash
-                .as_deref()
-                .map(|hash| H256::from_str(hash).expect("Incorrect prove_tx hash")),
-            proven_at: self
-                .proven_at
-                .map(|proven_at| DateTime::<Utc>::from_naive_utc_and_offset(proven_at, Utc)),
-            execute_tx_hash: self
-                .execute_tx_hash
-                .as_deref()
-                .map(|hash| H256::from_str(hash).expect("Incorrect execute_tx hash")),
-            executed_at: self
-                .executed_at
-                .map(|executed_at| DateTime::<Utc>::from_naive_utc_and_offset(executed_at, Utc)),
-            l1_gas_price: self.l1_gas_price as u64,
-            l2_fair_gas_price: self.l2_fair_gas_price as u64,
-            // TODO (SMA-1635): Make these filed non optional in database
+pub(crate) struct SyncBlock {
+    pub number: L2BlockNumber,
+    pub l1_batch_number: L1BatchNumber,
+    pub last_in_batch: bool,
+    pub timestamp: u64,
+    pub l1_gas_price: u64,
+    pub l2_fair_gas_price: u64,
+    pub fair_pubdata_price: Option<u64>,
+    pub base_system_contracts_hashes: BaseSystemContractsHashes,
+    pub fee_account_address: Address,
+    pub virtual_blocks: u32,
+    pub hash: H256,
+    pub protocol_version: ProtocolVersionId,
+    pub pubdata_params: PubdataParams,
+}
+
+impl TryFrom<StorageSyncBlock> for SyncBlock {
+    type Error = sqlx::Error;
+
+    fn try_from(block: StorageSyncBlock) -> Result<Self, Self::Error> {
+        Ok(Self {
+            number: L2BlockNumber(block.number.try_into().decode_column("number")?),
+            l1_batch_number: L1BatchNumber(
+                block
+                    .l1_batch_number
+                    .try_into()
+                    .decode_column("l1_batch_number")?,
+            ),
+            last_in_batch: block.tx_count == 0,
+            timestamp: block.timestamp.try_into().decode_column("timestamp")?,
+            l1_gas_price: block
+                .l1_gas_price
+                .try_into()
+                .decode_column("l1_gas_price")?,
+            l2_fair_gas_price: block
+                .l2_fair_gas_price
+                .try_into()
+                .decode_column("l2_fair_gas_price")?,
+            fair_pubdata_price: block
+                .fair_pubdata_price
+                .map(|v| v.try_into().decode_column("fair_pubdata_price"))
+                .transpose()?,
+            // TODO (SMA-1635): Make these fields non optional in database
             base_system_contracts_hashes: BaseSystemContractsHashes {
-                bootloader: self
-                    .bootloader_code_hash
-                    .map(|bootloader_code_hash| H256::from_slice(&bootloader_code_hash))
-                    .expect("Should not be none"),
-                default_aa: self
-                    .default_aa_code_hash
-                    .map(|default_aa_code_hash| H256::from_slice(&default_aa_code_hash))
-                    .expect("Should not be none"),
+                bootloader: parse_h256_opt(block.bootloader_code_hash.as_deref())
+                    .decode_column("bootloader_code_hash")?,
+                default_aa: parse_h256_opt(block.default_aa_code_hash.as_deref())
+                    .decode_column("default_aa_code_hash")?,
+                evm_emulator: block
+                    .evm_emulator_code_hash
+                    .as_deref()
+                    .map(parse_h256)
+                    .transpose()
+                    .decode_column("evm_emulator_code_hash")?,
             },
-            operator_address: self
-                .fee_account_address
-                .map(|fee_account_address| Address::from_slice(&fee_account_address))
-                .unwrap_or(current_operator_address),
+            fee_account_address: parse_h160(&block.fee_account_address)
+                .decode_column("fee_account_address")?,
+            virtual_blocks: block
+                .virtual_blocks
+                .try_into()
+                .decode_column("virtual_blocks")?,
+            hash: parse_h256(&block.hash).decode_column("hash")?,
+            protocol_version: parse_protocol_version(block.protocol_version)?,
+            pubdata_params: PubdataParams {
+                pubdata_type: PubdataType::from_str(&block.pubdata_type)
+                    .decode_column("Invalid pubdata type")?,
+                l2_da_validator_address: parse_h160(&block.l2_da_validator_address)
+                    .decode_column("l2_da_validator_address")?,
+            },
+        })
+    }
+}
+
+impl SyncBlock {
+    pub(crate) fn into_api(self, transactions: Option<Vec<Transaction>>) -> en::SyncBlock {
+        en::SyncBlock {
+            number: self.number,
+            l1_batch_number: self.l1_batch_number,
+            last_in_batch: self.last_in_batch,
+            timestamp: self.timestamp,
+            l1_gas_price: self.l1_gas_price,
+            l2_fair_gas_price: self.l2_fair_gas_price,
+            fair_pubdata_price: self.fair_pubdata_price,
+            base_system_contracts_hashes: self.base_system_contracts_hashes,
+            operator_address: self.fee_account_address,
             transactions,
-            virtual_blocks: Some(self.virtual_blocks as u32),
-            hash: Some(H256::from_slice(&self.hash)),
-            protocol_version: (self.protocol_version as u16).try_into().unwrap(),
+            virtual_blocks: Some(self.virtual_blocks),
+            hash: Some(self.hash),
+            protocol_version: self.protocol_version,
+            pubdata_params: Some(self.pubdata_params),
+        }
+    }
+
+    pub(crate) fn into_payload(self, transactions: Vec<Transaction>) -> Payload {
+        Payload {
+            protocol_version: self.protocol_version,
+            hash: self.hash,
+            l1_batch_number: self.l1_batch_number,
+            timestamp: self.timestamp,
+            l1_gas_price: self.l1_gas_price,
+            l2_fair_gas_price: self.l2_fair_gas_price,
+            fair_pubdata_price: self.fair_pubdata_price,
+            virtual_blocks: self.virtual_blocks,
+            operator_address: self.fee_account_address,
+            transactions,
+            last_in_batch: self.last_in_batch,
+            pubdata_params: self.pubdata_params,
         }
     }
 }

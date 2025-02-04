@@ -1,23 +1,28 @@
 import * as hre from 'hardhat';
 import * as fs from 'fs';
-import { spawn as _spawn } from 'child_process';
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+import { exec as _exec, spawn as _spawn } from 'child_process';
 
-import { getZksolcPath, getZksolcUrl, saltFromUrl } from '@matterlabs/hardhat-zksync-solc';
+import { getZksolcUrl, saltFromUrl } from '@matterlabs/hardhat-zksync-solc';
+import { getCompilersDir } from 'hardhat/internal/util/global-dir';
+import path from 'path';
 
-const COMPILER_VERSION = '1.3.14';
+const COMPILER_VERSION = '1.5.10';
 const IS_COMPILER_PRE_RELEASE = false;
 
 async function compilerLocation(): Promise<string> {
+    const compilersCache = await getCompilersDir();
+
+    let salt = '';
+
     if (IS_COMPILER_PRE_RELEASE) {
         const url = getZksolcUrl('https://github.com/matter-labs/zksolc-prerelease', hre.config.zksolc.version);
-        const salt = saltFromUrl(url);
-        return await getZksolcPath(COMPILER_VERSION, salt);
-    } else {
-        return await getZksolcPath(COMPILER_VERSION, '');
+        salt = saltFromUrl(url);
     }
+
+    return path.join(compilersCache, 'zksolc', `zksolc-v${COMPILER_VERSION}${salt ? '-' : ''}${salt}`);
 }
 
-// executes a command in a new shell
 // but pipes data to parent's stdout/stderr
 export function spawn(command: string) {
     command = command.replace(/\n/g, ' ');
@@ -30,38 +35,50 @@ export function spawn(command: string) {
     });
 }
 
-export async function compile(path: string, files: string[], outputDirName: string | null, type: string) {
+export async function compile(
+    pathToHome: string,
+    path: string,
+    files: string[],
+    outputDirName: string | null,
+    type: string
+) {
     if (!files.length) {
         console.log(`No test files provided in folder ${path}.`);
         return;
     }
-    let paths = preparePaths(path, files, outputDirName);
+    let paths = preparePaths(pathToHome, path, files, outputDirName);
 
-    let systemMode = type === 'yul' ? '--system-mode  --optimization 3' : '';
+    let eraVmExtensions = type === 'yul' ? '--enable-eravm-extensions  --optimization 3' : '';
 
     const zksolcLocation = await compilerLocation();
     await spawn(
-        `${zksolcLocation} ${paths.absolutePathSources}/${paths.outputDir} ${systemMode} --${type} --bin --overwrite -o ${paths.absolutePathArtifacts}/${paths.outputDir}`
+        `${zksolcLocation} ${paths.absolutePathSources}/${paths.outputDir} ${eraVmExtensions} --${type} --bin --overwrite -o ${paths.absolutePathArtifacts}/${paths.outputDir}`
     );
 }
 
-export async function compileFolder(path: string, type: string) {
+export async function compileFolder(pathToHome: string, path: string, type: string) {
+    let compilationMode;
+    if (type === 'zkasm') {
+        compilationMode = 'eravm-assembly';
+    } else {
+        compilationMode = type;
+    }
     let files: string[] = (await fs.promises.readdir(path)).filter((fn) => fn.endsWith(`.${type}`));
     for (const file of files) {
-        await compile(path, [file], `${file}`, type);
+        await compile(pathToHome, path, [file], `${file}`, compilationMode);
     }
 }
 
-function preparePaths(path: string, files: string[], outputDirName: string | null): CompilerPaths {
+function preparePaths(pathToHome: string, path: string, files: string[], outputDirName: string | null): CompilerPaths {
     const filePaths = files
         .map((val, _) => {
             return `sources/${val}`;
         })
         .join(' ');
     const outputDir = outputDirName || files[0];
-    let absolutePathSources = `${process.env.ZKSYNC_HOME}/core/tests/ts-integration/${path}`;
+    let absolutePathSources = `${pathToHome}/core/tests/ts-integration/${path}`;
 
-    let absolutePathArtifacts = `${process.env.ZKSYNC_HOME}/core/tests/ts-integration/${path}/artifacts`;
+    let absolutePathArtifacts = `${pathToHome}/core/tests/ts-integration/${path}/artifacts`;
 
     return new CompilerPaths(filePaths, outputDir, absolutePathSources, absolutePathArtifacts);
 }
@@ -71,6 +88,7 @@ class CompilerPaths {
     public outputDir: string;
     public absolutePathSources: string;
     public absolutePathArtifacts: string;
+
     constructor(filePath: string, outputDir: string, absolutePathSources: string, absolutePathArtifacts: string) {
         this.filePath = filePath;
         this.outputDir = outputDir;
@@ -80,8 +98,9 @@ class CompilerPaths {
 }
 
 async function main() {
-    await compileFolder('contracts/yul', 'yul');
-    await compileFolder('contracts/zkasm', 'zkasm');
+    const pathToHome = path.join(__dirname, '../../../../');
+    await compileFolder(pathToHome, 'contracts/yul', 'yul');
+    await compileFolder(pathToHome, 'contracts/zkasm', 'zkasm');
 }
 
 main()
