@@ -22,6 +22,8 @@ pub enum DeserializeErrorKind {
     /// Bit mask specifying a child kind in an internal tree node is invalid.
     #[error("invalid bit mask specifying a child kind in an internal tree node")]
     InvalidChildKind,
+    #[error("data left after deserialization")]
+    Leftovers,
 
     /// Missing required tag in the tree manifest.
     #[error("missing required tag `{0}` in tree manifest")]
@@ -135,11 +137,43 @@ impl fmt::Display for DeserializeError {
 
 impl error::Error for DeserializeError {}
 
+/// Error accessing a specific tree version.
+#[derive(Debug)]
+pub struct NoVersionError {
+    /// Missing requested version of the tree.
+    pub missing_version: u64,
+    /// Current number of versions in the tree.
+    pub version_count: u64,
+}
+
+impl fmt::Display for NoVersionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let &Self {
+            missing_version,
+            version_count,
+        } = self;
+        if missing_version >= version_count {
+            write!(
+                formatter,
+                "version {missing_version} does not exist in Merkle tree; it has {version_count} versions"
+            )
+        } else {
+            write!(
+                formatter,
+                "version {missing_version} was pruned from Merkle tree"
+            )
+        }
+    }
+}
+
+impl error::Error for NoVersionError {}
+
 #[cfg(test)]
 mod tests {
+    use zksync_types::U256;
+
     use super::*;
     use crate::{types::Nibbles, Key};
-    use zksync_types::U256;
 
     const TEST_KEY: Key = U256([0, 0, 0, 0x_dead_beef_0000_0000]);
 

@@ -1,39 +1,52 @@
 use std::convert::TryFrom;
 
+use anyhow::Context as _;
 use num_enum::TryFromPrimitive;
-use rlp::{Rlp, RlpStream};
+use rlp::Rlp;
+use serde::{Deserialize, Serialize};
+use zksync_crypto_primitives::K256PrivateKey;
 
 use self::error::SignError;
-use crate::transaction_request::PaymasterParams;
-use crate::LEGACY_TX_TYPE;
-
 use crate::{
-    api, tx::primitives::PackedEthSignature, tx::Execute, web3::types::U64, Address, Bytes,
-    EIP712TypedStructure, Eip712Domain, ExecuteTransactionCommon, InputData, L2ChainId, Nonce,
-    StructBuilder, Transaction, EIP_1559_TX_TYPE, EIP_2930_TX_TYPE, EIP_712_TX_TYPE, H256,
-    PRIORITY_OPERATION_L2_TX_TYPE, PROTOCOL_UPGRADE_TX_TYPE, U256,
+    api,
+    api::TransactionRequest,
+    fee::{encoding_len, Fee},
+    helpers::unix_timestamp_ms,
+    transaction_request::PaymasterParams,
+    tx::Execute,
+    web3::Bytes,
+    Address, EIP712TypedStructure, ExecuteTransactionCommon, InputData, L2ChainId, Nonce,
+    PackedEthSignature, StructBuilder, Transaction, EIP_1559_TX_TYPE, EIP_2930_TX_TYPE,
+    EIP_712_TX_TYPE, H256, LEGACY_TX_TYPE, PRIORITY_OPERATION_L2_TX_TYPE, PROTOCOL_UPGRADE_TX_TYPE,
+    U256, U64,
 };
-
-use serde::{Deserialize, Serialize};
 
 pub mod error;
 
-use crate::api::TransactionRequest;
-use crate::fee::{encoding_len, Fee};
-use crate::helpers::unix_timestamp_ms;
-
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, TryFromPrimitive)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, TryFromPrimitive)]
 #[repr(u32)]
 pub enum TransactionType {
     // Native ECDSA Transaction
     LegacyTransaction = 0,
-
     EIP2930Transaction = 1,
     EIP1559Transaction = 2,
-    // Eip 712 transaction with additional fields specified for zksync
+    // EIP 712 transaction with additional fields specified for ZKsync
     EIP712Transaction = EIP_712_TX_TYPE as u32,
     PriorityOpTransaction = PRIORITY_OPERATION_L2_TX_TYPE as u32,
     ProtocolUpgradeTransaction = PROTOCOL_UPGRADE_TX_TYPE as u32,
+}
+
+impl TransactionType {
+    /// Returns whether a transaction type is an Ethereum transaction type.
+    pub fn is_ethereum_type(&self) -> bool {
+        matches!(
+            self,
+            TransactionType::LegacyTransaction
+                | TransactionType::EIP2930Transaction
+                | TransactionType::EIP1559Transaction
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,7 +106,7 @@ impl L2TxCommonData {
         self.input = Some(InputData { hash, data: input })
     }
 
-    pub fn extract_chain_id(&self) -> Option<u16> {
+    pub fn extract_chain_id(&self) -> Option<u64> {
         let bytes = self.input_data()?;
         let chain_id = match bytes.first() {
             Some(x) if *x >= 0x80 => {
@@ -140,13 +153,13 @@ pub struct L2Tx {
 impl L2Tx {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        contract_address: Address,
+        contract_address: Option<Address>,
         calldata: Vec<u8>,
         nonce: Nonce,
         fee: Fee,
         initiator_address: Address,
         value: U256,
-        factory_deps: Option<Vec<Vec<u8>>>,
+        factory_deps: Vec<Vec<u8>>,
         paymaster_params: PaymasterParams,
     ) -> Self {
         Self {
@@ -172,18 +185,18 @@ impl L2Tx {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_signed(
-        contract_address: Address,
+        contract_address: Option<Address>,
         calldata: Vec<u8>,
         nonce: Nonce,
         fee: Fee,
         value: U256,
         chain_id: L2ChainId,
-        private_key: &H256,
-        factory_deps: Option<Vec<Vec<u8>>>,
+        private_key: &K256PrivateKey,
+        factory_deps: Vec<Vec<u8>>,
         paymaster_params: PaymasterParams,
     ) -> Result<Self, SignError> {
-        let initiator_address = PackedEthSignature::address_from_private_key(private_key).unwrap();
-        let mut res = Self::new(
+        let initiator_address = private_key.address();
+        let tx = Self::new(
             contract_address,
             calldata,
             nonce,
@@ -193,10 +206,21 @@ impl L2Tx {
             factory_deps,
             paymaster_params,
         );
-
-        let data = res.get_signed_bytes(chain_id);
-        res.set_signature(PackedEthSignature::sign_raw(private_key, &data)?);
-        Ok(res)
+        // We do a whole dance to reconstruct missing data: RLP encoding, hash and signature.
+        let mut req: TransactionRequest = tx.into();
+        req.chain_id = Some(chain_id.as_u64());
+        let data = req
+            .get_default_signed_message()
+            .context("get_default_signed_message()")?;
+        let sig = PackedEthSignature::sign_raw(private_key, &data).context("sign_raw")?;
+        let raw = req.get_signed_bytes(&sig).context("get_signed_bytes")?;
+        let (req, hash) =
+            TransactionRequest::from_bytes_unverified(&raw).context("from_bytes_unverified()")?;
+        // Since we allow users to specify `None` recipient, EVM emulation is implicitly enabled.
+        let mut tx =
+            L2Tx::from_request_unverified(req, true).context("from_request_unverified()")?;
+        tx.set_input(raw, hash);
+        Ok(tx)
     }
 
     /// Returns the hash of the transaction.
@@ -210,7 +234,7 @@ impl L2Tx {
     }
 
     /// Returns recipient account of the transaction.
-    pub fn recipient_account(&self) -> Address {
+    pub fn recipient_account(&self) -> Option<Address> {
         self.execute.contract_address
     }
 
@@ -223,24 +247,11 @@ impl L2Tx {
         self.common_data.set_input(data, hash)
     }
 
-    pub fn get_rlp_bytes(&self, chain_id: L2ChainId) -> Bytes {
-        let mut rlp_stream = RlpStream::new();
-        let tx: TransactionRequest = self.clone().into();
-        tx.rlp(&mut rlp_stream, chain_id.0, None);
-        Bytes(rlp_stream.as_raw().to_vec())
-    }
-
     pub fn get_signed_bytes(&self, chain_id: L2ChainId) -> H256 {
-        let tx: TransactionRequest = self.clone().into();
-        if tx.is_eip712_tx() {
-            PackedEthSignature::typed_data_to_signed_bytes(&Eip712Domain::new(chain_id), &tx)
-        } else {
-            let mut data = self.get_rlp_bytes(chain_id).0;
-            if let Some(tx_type) = tx.transaction_type {
-                data.insert(0, tx_type.as_u32() as u8);
-            }
-            PackedEthSignature::message_to_signed_bytes(&data)
-        }
+        let mut req: TransactionRequest = self.clone().into();
+        req.chain_id = Some(chain_id.as_u64());
+        // It is ok to unwrap, because the `chain_id` is set.
+        req.get_default_signed_message().unwrap()
     }
 
     pub fn set_signature(&mut self, signature: PackedEthSignature) {
@@ -258,7 +269,7 @@ impl L2Tx {
     pub fn abi_encoding_len(&self) -> usize {
         let data_len = self.execute.calldata.len();
         let signature_len = self.common_data.signature.len();
-        let factory_deps_len = self.execute.factory_deps_length();
+        let factory_deps_len = self.execute.factory_deps.len();
         let paymaster_input_len = self.common_data.paymaster_params.paymaster_input.len();
 
         encoding_len(
@@ -281,16 +292,15 @@ impl L2Tx {
     pub fn factory_deps_len(&self) -> u32 {
         self.execute
             .factory_deps
-            .as_ref()
-            .map(|deps| deps.iter().fold(0u32, |len, item| len + item.len() as u32))
-            .unwrap_or_default()
+            .iter()
+            .fold(0u32, |len, item| len + item.len() as u32)
     }
 }
 
 fn signature_to_vrs(signature: &[u8], tx_type: u32) -> (Option<U64>, Option<U256>, Option<U256>) {
     let signature = if tx_type == LEGACY_TX_TYPE as u32 {
         // Note that we use `deserialize_packed_no_v_check` here, because we want to preserve the original `v` value.
-        // This is needed due to inconsistent behaviour on Ethereum where the `v` value is >= 27 for legacy transactions
+        // This is needed due to inconsistent behavior on Ethereum where the `v` value is >= 27 for legacy transactions
         // and is either 0 or 1 for other ones.
         PackedEthSignature::deserialize_packed_no_v_check(signature)
     } else {
@@ -316,7 +326,7 @@ impl From<L2Tx> for TransactionRequest {
         let mut base_tx_req = TransactionRequest {
             nonce: U256::from(tx.common_data.nonce.0),
             from: Some(tx.common_data.initiator_address),
-            to: Some(tx.recipient_account()),
+            to: tx.recipient_account(),
             value: tx.execute.value,
             gas_price: tx.common_data.fee.max_fee_per_gas,
             max_priority_fee_per_gas: None,
@@ -329,7 +339,7 @@ impl From<L2Tx> for TransactionRequest {
             transaction_type: None,
             access_list: None,
             eip712_meta: None,
-            chain_id: tx.common_data.extract_chain_id().unwrap_or_default().into(),
+            chain_id: tx.common_data.extract_chain_id(),
         };
         match tx_type as u8 {
             LEGACY_TX_TYPE => {}
@@ -386,19 +396,27 @@ impl From<L2Tx> for api::Transaction {
             } else {
                 (None, None, None)
             };
+        // Legacy transactions are not supposed to have `yParity` and are reliant on `v` instead.
+        // Other transactions are required to have `yParity` which replaces the deprecated `v` value
+        // (still included for backwards compatibility).
+        let y_parity = match tx.common_data.transaction_type {
+            TransactionType::LegacyTransaction => None,
+            _ => v,
+        };
 
         Self {
             hash: tx.hash(),
-            chain_id: tx.common_data.extract_chain_id().unwrap_or_default().into(),
+            chain_id: U256::from(tx.common_data.extract_chain_id().unwrap_or_default()),
             nonce: U256::from(tx.common_data.nonce.0),
             from: Some(tx.common_data.initiator_address),
-            to: Some(tx.recipient_account()),
+            to: tx.recipient_account(),
             value: tx.execute.value,
             gas_price: Some(tx.common_data.fee.max_fee_per_gas),
             max_priority_fee_per_gas: Some(tx.common_data.fee.max_priority_fee_per_gas),
             max_fee_per_gas: Some(tx.common_data.fee.max_fee_per_gas),
             gas: tx.common_data.fee.gas_limit,
             input: Bytes(tx.execute.calldata),
+            y_parity,
             v,
             r,
             s,
@@ -463,12 +481,11 @@ impl EIP712TypedStructure for L2Tx {
 mod tests {
     use zksync_basic_types::{Nonce, U256};
 
+    use super::{L2Tx, TransactionType};
     use crate::{
         api::TransactionRequest, fee::Fee, transaction_request::PaymasterParams, Execute,
         L2TxCommonData,
     };
-
-    use super::{L2Tx, TransactionType};
 
     #[test]
     fn test_correct_l2_tx_transaction_request_conversion() {
@@ -479,7 +496,7 @@ mod tests {
                 contract_address: Default::default(),
                 calldata: vec![],
                 value: U256::zero(),
-                factory_deps: None,
+                factory_deps: vec![],
             },
             common_data: L2TxCommonData {
                 nonce: Nonce(0),

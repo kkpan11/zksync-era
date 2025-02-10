@@ -1,8 +1,10 @@
-use zksync_types::contract_verification_api::{
-    CompilerType, CompilerVersions, SourceCodeData, VerificationIncomingRequest,
-    VerificationRequest,
+use zksync_types::{
+    contract_verification::api::{
+        CompilerType, CompilerVersions, SourceCodeData, VerificationIncomingRequest,
+        VerificationRequest,
+    },
+    Address,
 };
-use zksync_types::Address;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct StorageVerificationRequest {
@@ -10,12 +12,13 @@ pub struct StorageVerificationRequest {
     pub contract_address: Vec<u8>,
     pub source_code: String,
     pub contract_name: String,
-    pub zk_compiler_version: String,
+    pub zk_compiler_version: Option<String>,
     pub compiler_version: String,
     pub optimization_used: bool,
     pub optimizer_mode: Option<String>,
     pub constructor_arguments: Vec<u8>,
     pub is_system: bool,
+    pub force_evmla: bool,
 }
 
 impl From<StorageVerificationRequest> for VerificationRequest {
@@ -42,6 +45,7 @@ impl From<StorageVerificationRequest> for VerificationRequest {
                 optimizer_mode: value.optimizer_mode,
                 constructor_arguments: value.constructor_arguments.into(),
                 is_system: value.is_system,
+                force_evmla: value.force_evmla,
             },
         }
     }

@@ -6,8 +6,11 @@ use std::{
     time::Duration,
 };
 
+use vise::{
+    Buckets, EncodeLabelSet, EncodeLabelValue, Family, Gauge, Global, Histogram, Metrics, Unit,
+};
+
 use crate::types::Nibbles;
-use vise::{Buckets, EncodeLabelSet, EncodeLabelValue, Family, Gauge, Global, Histogram, Metrics};
 
 #[derive(Debug, Metrics)]
 #[metrics(prefix = "merkle_tree")]
@@ -16,6 +19,7 @@ pub(crate) struct GeneralMetrics {
     pub leaf_count: Gauge<u64>,
 }
 
+#[vise::register]
 pub(crate) static GENERAL_METRICS: Global<GeneralMetrics> = Global::new();
 
 const BYTE_SIZE_BUCKETS: Buckets = Buckets::exponential(65_536.0..=16.0 * 1_024.0 * 1_024.0, 2.0);
@@ -23,19 +27,20 @@ const BYTE_SIZE_BUCKETS: Buckets = Buckets::exponential(65_536.0..=16.0 * 1_024.
 #[derive(Debug, Metrics)]
 #[metrics(prefix = "merkle_tree_finalize_patch")]
 struct HashingMetrics {
-    /// Total amount of hashing input performed while processing a single block.
-    #[metrics(buckets = BYTE_SIZE_BUCKETS)]
-    hashed_bytes: Histogram<u64>,
+    /// Total amount of hashing input performed while processing a patch.
+    #[metrics(buckets = BYTE_SIZE_BUCKETS, unit = Unit::Bytes)]
+    hashed: Histogram<u64>,
+    /// Total time spent on hashing while processing a patch.
+    #[metrics(buckets = Buckets::LATENCIES, unit = Unit::Seconds)]
+    hashing_duration: Histogram<Duration>,
 }
-
-#[vise::register]
-static HASHING_METRICS: Global<HashingMetrics> = Global::new();
 
 /// Hashing-related statistics reported as metrics for each block of operations.
 #[derive(Debug, Default)]
 #[must_use = "hashing stats should be `report()`ed"]
 pub(crate) struct HashingStats {
     pub hashed_bytes: AtomicU64,
+    pub hashing_duration: Duration,
 }
 
 impl HashingStats {
@@ -44,8 +49,14 @@ impl HashingStats {
     }
 
     pub fn report(self) {
+        #[vise::register]
+        static HASHING_METRICS: Global<HashingMetrics> = Global::new();
+
         let hashed_bytes = self.hashed_bytes.into_inner();
-        HASHING_METRICS.hashed_bytes.observe(hashed_bytes);
+        HASHING_METRICS.hashed.observe(hashed_bytes);
+        HASHING_METRICS
+            .hashing_duration
+            .observe(self.hashing_duration);
     }
 }
 
@@ -56,37 +67,37 @@ const LEAF_LEVEL_BUCKETS: Buckets = Buckets::linear(20.0..=40.0, 4.0);
 #[metrics(prefix = "merkle_tree_extend_patch")]
 struct TreeUpdateMetrics {
     // Metrics related to the AR16MT tree architecture
-    /// Number of new leaves inserted during tree traversal while processing a single block.
+    /// Number of new leaves inserted during tree traversal while processing a single batch.
     #[metrics(buckets = NODE_COUNT_BUCKETS)]
     new_leaves: Histogram<u64>,
-    /// Number of new internal nodes inserted during tree traversal while processing a single block.
+    /// Number of new internal nodes inserted during tree traversal while processing a single batch.
     #[metrics(buckets = NODE_COUNT_BUCKETS)]
     new_internal_nodes: Histogram<u64>,
-    /// Number of existing leaves moved to a new location while processing a single block.
+    /// Number of existing leaves moved to a new location while processing a single batch.
     #[metrics(buckets = NODE_COUNT_BUCKETS)]
     moved_leaves: Histogram<u64>,
-    /// Number of existing leaves updated while processing a single block.
+    /// Number of existing leaves updated while processing a single batch.
     #[metrics(buckets = NODE_COUNT_BUCKETS)]
     updated_leaves: Histogram<u64>,
-    /// Average level of leaves moved or created while processing a single block.
+    /// Average level of leaves moved or created while processing a single batch.
     #[metrics(buckets = LEAF_LEVEL_BUCKETS)]
     avg_leaf_level: Histogram<f64>,
-    /// Maximum level of leaves moved or created while processing a single block.
+    /// Maximum level of leaves moved or created while processing a single batch.
     #[metrics(buckets = LEAF_LEVEL_BUCKETS)]
     max_leaf_level: Histogram<u64>,
 
     // Metrics related to input instructions
-    /// Number of keys read while processing a single block (only applicable to the full operation mode).
+    /// Number of keys read while processing a single batch (only applicable to the full operation mode).
     #[metrics(buckets = NODE_COUNT_BUCKETS)]
     key_reads: Histogram<u64>,
-    /// Number of missing keys read while processing a single block (only applicable to the full
+    /// Number of missing keys read while processing a single batch (only applicable to the full
     /// operation mode).
     #[metrics(buckets = NODE_COUNT_BUCKETS)]
     missing_key_reads: Histogram<u64>,
-    /// Number of nodes of previous versions read from the DB while processing a single block.
+    /// Number of nodes of previous versions read from the DB while processing a single batch.
     #[metrics(buckets = NODE_COUNT_BUCKETS)]
     db_reads: Histogram<u64>,
-    /// Number of nodes of the current version re-read from the patch set while processing a single block.
+    /// Number of nodes of the current version re-read from the patch set while processing a single batch.
     #[metrics(buckets = NODE_COUNT_BUCKETS)]
     patch_reads: Histogram<u64>,
 }
@@ -95,7 +106,7 @@ struct TreeUpdateMetrics {
 static TREE_UPDATE_METRICS: Global<TreeUpdateMetrics> = Global::new();
 
 #[must_use = "tree updater stats should be `report()`ed"]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct TreeUpdaterStats {
     pub new_leaves: u64,
     pub new_internal_nodes: u64,
@@ -109,6 +120,24 @@ pub(crate) struct TreeUpdaterStats {
     pub patch_reads: u64,
 }
 
+impl fmt::Debug for TreeUpdaterStats {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TreeUpdaterStats")
+            .field("new_leaves", &self.new_leaves)
+            .field("new_internal_nodes", &self.new_internal_nodes)
+            .field("moved_leaves", &self.moved_leaves)
+            .field("updated_leaves", &self.updated_leaves)
+            .field("avg_leaf_level", &self.avg_leaf_level())
+            .field("max_leaf_level", &self.max_leaf_level)
+            .field("key_reads", &self.key_reads)
+            .field("missing_key_reads", &self.missing_key_reads)
+            .field("db_reads", &self.db_reads)
+            .field("patch_reads", &self.patch_reads)
+            .finish_non_exhaustive()
+    }
+}
+
 impl TreeUpdaterStats {
     pub(crate) fn update_leaf_levels(&mut self, nibble_count: usize) {
         let leaf_level = nibble_count as u64 * 4;
@@ -117,20 +146,22 @@ impl TreeUpdaterStats {
     }
 
     #[allow(clippy::cast_precision_loss)] // Acceptable for metrics
+    fn avg_leaf_level(&self) -> f64 {
+        let touched_leaves = self.new_leaves + self.moved_leaves;
+        if touched_leaves > 0 {
+            self.leaf_level_sum as f64 / touched_leaves as f64
+        } else {
+            0.0
+        }
+    }
+
     pub(crate) fn report(self) {
         let metrics = &TREE_UPDATE_METRICS;
         metrics.new_leaves.observe(self.new_leaves);
         metrics.new_internal_nodes.observe(self.new_internal_nodes);
         metrics.moved_leaves.observe(self.moved_leaves);
         metrics.updated_leaves.observe(self.updated_leaves);
-
-        let touched_leaves = self.new_leaves + self.moved_leaves;
-        let avg_leaf_level = if touched_leaves > 0 {
-            self.leaf_level_sum as f64 / touched_leaves as f64
-        } else {
-            0.0
-        };
-        metrics.avg_leaf_level.observe(avg_leaf_level);
+        metrics.avg_leaf_level.observe(self.avg_leaf_level());
         metrics.max_leaf_level.observe(self.max_leaf_level);
 
         if self.key_reads > 0 {
@@ -163,13 +194,13 @@ impl ops::AddAssign for TreeUpdaterStats {
 #[derive(Debug, Metrics)]
 #[metrics(prefix = "merkle_tree")]
 pub(crate) struct BlockTimings {
-    /// Time spent loading tree nodes from DB per block.
+    /// Time spent loading tree nodes from DB per batch.
     #[metrics(buckets = Buckets::LATENCIES)]
     pub load_nodes: Histogram<Duration>,
-    /// Time spent traversing the tree and creating new nodes per block.
+    /// Time spent traversing the tree and creating new nodes per batch.
     #[metrics(buckets = Buckets::LATENCIES)]
     pub extend_patch: Histogram<Duration>,
-    /// Time spent finalizing the block (mainly hash computations).
+    /// Time spent finalizing a batch (mainly hash computations).
     #[metrics(buckets = Buckets::LATENCIES)]
     pub finalize_patch: Histogram<Duration>,
 }
@@ -202,13 +233,13 @@ impl fmt::Display for NibbleCount {
 #[derive(Debug, Metrics)]
 #[metrics(prefix = "merkle_tree_apply_patch")]
 struct ApplyPatchMetrics {
-    /// Total number of nodes included into a RocksDB patch per block.
+    /// Total number of nodes included into a RocksDB patch per batch.
     #[metrics(buckets = NODE_COUNT_BUCKETS)]
     nodes: Histogram<u64>,
-    /// Number of nodes included into a RocksDB patch per block, grouped by the key nibble count.
+    /// Number of nodes included into a RocksDB patch per batch, grouped by the key nibble count.
     #[metrics(buckets = NODE_COUNT_BUCKETS)]
     nodes_by_nibble_count: Family<NibbleCount, Histogram<u64>>,
-    /// Total byte size of nodes included into a RocksDB patch per block, grouped by the key nibble count.
+    /// Total byte size of nodes included into a RocksDB patch per batch, grouped by the key nibble count.
     #[metrics(buckets = BYTE_SIZE_BUCKETS)]
     node_bytes: Family<NibbleCount, Histogram<u64>>,
     /// Number of hashes in child references copied from previous tree versions. Allows to estimate
@@ -264,7 +295,7 @@ impl ApplyPatchStats {
         for (nibble_count, stats) in node_bytes {
             let label = NibbleCount::new(nibble_count);
             metrics.nodes_by_nibble_count[&label].observe(stats.count);
-            metrics.nodes_by_nibble_count[&label].observe(stats.bytes);
+            metrics.node_bytes[&label].observe(stats.bytes);
         }
 
         metrics.copied_hashes.observe(self.copied_hashes);
@@ -278,6 +309,21 @@ enum Bound {
     End,
 }
 
+const LARGE_NODE_COUNT_BUCKETS: Buckets = Buckets::values(&[
+    1_000.0,
+    2_000.0,
+    5_000.0,
+    10_000.0,
+    20_000.0,
+    50_000.0,
+    100_000.0,
+    200_000.0,
+    500_000.0,
+    1_000_000.0,
+    2_000_000.0,
+    5_000_000.0,
+]);
+
 #[derive(Debug, Metrics)]
 #[metrics(prefix = "merkle_tree_pruning")]
 struct PruningMetrics {
@@ -285,7 +331,7 @@ struct PruningMetrics {
     /// may not remove all stale keys to this version if there are too many.
     target_retained_version: Gauge<u64>,
     /// Number of pruned node keys on a specific pruning iteration.
-    #[metrics(buckets = NODE_COUNT_BUCKETS)]
+    #[metrics(buckets = LARGE_NODE_COUNT_BUCKETS)]
     key_count: Histogram<usize>,
     /// Lower and upper boundaries on the new stale key versions deleted
     /// during a pruning iteration. The lower boundary is inclusive, the upper one is exclusive.
@@ -296,14 +342,14 @@ struct PruningMetrics {
 static PRUNING_METRICS: Global<PruningMetrics> = Global::new();
 
 #[derive(Debug)]
-pub(crate) struct PruningStats {
+pub struct PruningStats {
     pub target_retained_version: u64,
     pub pruned_key_count: usize,
     pub deleted_stale_key_versions: ops::Range<u64>,
 }
 
 impl PruningStats {
-    pub fn report(self) {
+    pub fn report(&self) {
         PRUNING_METRICS
             .target_retained_version
             .set(self.target_retained_version);
@@ -328,3 +374,27 @@ pub(crate) struct PruningTimings {
 
 #[vise::register]
 pub(crate) static PRUNING_TIMINGS: Global<PruningTimings> = Global::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue, EncodeLabelSet)]
+#[metrics(label = "stage", rename_all = "snake_case")]
+pub(crate) enum RecoveryStage {
+    Extend,
+    ApplyPatch,
+    ParallelPersistence,
+}
+
+#[derive(Debug, Metrics)]
+#[metrics(prefix = "merkle_tree_recovery")]
+pub(crate) struct RecoveryMetrics {
+    /// Number of entries in a recovered chunk.
+    #[metrics(buckets = LARGE_NODE_COUNT_BUCKETS)]
+    pub chunk_size: Histogram<usize>,
+    /// Latency of a specific stage of recovery for a single chunk.
+    #[metrics(buckets = Buckets::LATENCIES, unit = Unit::Seconds)]
+    pub stage_latency: Family<RecoveryStage, Histogram<Duration>>,
+    /// Number of buffered commands if parallel persistence is used.
+    pub parallel_persistence_buffer_size: Gauge<usize>,
+}
+
+#[vise::register]
+pub(crate) static RECOVERY_METRICS: Global<RecoveryMetrics> = Global::new();

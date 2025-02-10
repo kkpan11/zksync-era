@@ -1,18 +1,32 @@
-use std::fmt::Debug;
-use std::time::{Duration, Instant};
+use std::{
+    fmt::Debug,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context as _;
 pub use async_trait::async_trait;
-use tokio::sync::watch;
-use tokio::task::JoinHandle;
-use tokio::time::sleep;
-
+use tokio::{sync::watch, task::JoinHandle};
+use vise::{Buckets, Counter, Histogram, LabeledFamily, Metrics};
 use zksync_utils::panic_extractor::try_extract_panic_message;
+
+const ATTEMPT_BUCKETS: Buckets = Buckets::exponential(1.0..=64.0, 2.0);
+
+#[derive(Debug, Metrics)]
+#[metrics(prefix = "job_processor")]
+struct JobProcessorMetrics {
+    #[metrics(labels = ["service_name", "job_id"])]
+    max_attempts_reached: LabeledFamily<(&'static str, String), Counter, 2>,
+    #[metrics(labels = ["service_name"], buckets = ATTEMPT_BUCKETS)]
+    attempts: LabeledFamily<&'static str, Histogram<usize>>,
+}
+
+#[vise::register]
+static METRICS: vise::Global<JobProcessorMetrics> = vise::Global::new();
 
 #[async_trait]
 pub trait JobProcessor: Sync + Send {
     type Job: Send + 'static;
-    type JobId: Send + Debug + 'static;
+    type JobId: Send + Sync + Debug + 'static;
     type JobArtifacts: Send + 'static;
 
     const POLLING_INTERVAL_MS: u64 = 1000;
@@ -32,6 +46,7 @@ pub trait JobProcessor: Sync + Send {
     /// Function that processes a job
     async fn process_job(
         &self,
+        job_id: &Self::JobId,
         job: Self::Job,
         started_at: Instant,
     ) -> JoinHandle<anyhow::Result<Self::JobArtifacts>>;
@@ -42,7 +57,7 @@ pub trait JobProcessor: Sync + Send {
     /// To process a batch, pass `Some(batch_size)`.
     async fn run(
         self,
-        stop_receiver: watch::Receiver<bool>,
+        mut stop_receiver: watch::Receiver<bool>,
         mut iterations_left: Option<usize>,
     ) -> anyhow::Result<()>
     where
@@ -69,9 +84,9 @@ pub trait JobProcessor: Sync + Send {
                     Self::SERVICE_NAME,
                     job_id
                 );
-                let task = self.process_job(job, started_at).await;
+                let task = self.process_job(&job_id, job, started_at).await;
 
-                self.wait_for_task(job_id, started_at, task)
+                self.wait_for_task(job_id, started_at, task, &mut stop_receiver)
                     .await
                     .context("wait_for_task")?;
             } else if iterations_left.is_some() {
@@ -79,7 +94,10 @@ pub trait JobProcessor: Sync + Send {
                 return Ok(());
             } else {
                 tracing::trace!("Backing off for {} ms", backoff);
-                sleep(Duration::from_millis(backoff)).await;
+                // Error here corresponds to a timeout w/o `stop_receiver` changed; we're OK with this.
+                tokio::time::timeout(Duration::from_millis(backoff), stop_receiver.changed())
+                    .await
+                    .ok();
                 backoff = (backoff * Self::BACKOFF_MULTIPLIER).min(Self::MAX_BACKOFF_MS);
             }
         }
@@ -93,7 +111,19 @@ pub trait JobProcessor: Sync + Send {
         job_id: Self::JobId,
         started_at: Instant,
         task: JoinHandle<anyhow::Result<Self::JobArtifacts>>,
+        stop_receiver: &mut watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
+        let attempts = self.get_job_attempts(&job_id).await?;
+        let max_attempts = self.max_attempts();
+        if attempts == max_attempts {
+            METRICS.max_attempts_reached[&(Self::SERVICE_NAME, format!("{job_id:?}"))].inc();
+            tracing::error!(
+                "Max attempts ({max_attempts}) reached for {} job {:?}",
+                Self::SERVICE_NAME,
+                job_id,
+            );
+        }
+
         let result = loop {
             tracing::trace!(
                 "Polling {} task with id {:?}. Is finished: {}",
@@ -104,7 +134,17 @@ pub trait JobProcessor: Sync + Send {
             if task.is_finished() {
                 break task.await;
             }
-            sleep(Duration::from_millis(Self::POLLING_INTERVAL_MS)).await;
+            if tokio::time::timeout(
+                Duration::from_millis(Self::POLLING_INTERVAL_MS),
+                stop_receiver.changed(),
+            )
+            .await
+            .is_ok()
+            {
+                // Stop signal received, return early.
+                // Exit will be processed/reported by the main loop.
+                return Ok(());
+            }
         };
         let error_message = match result {
             Ok(Ok(data)) => {
@@ -113,6 +153,7 @@ pub trait JobProcessor: Sync + Send {
                     Self::SERVICE_NAME,
                     job_id
                 );
+                METRICS.attempts[&Self::SERVICE_NAME].observe(attempts as usize);
                 return self
                     .save_result(job_id, started_at, data)
                     .await
@@ -127,6 +168,7 @@ pub trait JobProcessor: Sync + Send {
             job_id,
             error_message
         );
+
         self.save_failure(job_id, started_at, error_message).await;
         Ok(())
     }
@@ -138,4 +180,9 @@ pub trait JobProcessor: Sync + Send {
         started_at: Instant,
         artifacts: Self::JobArtifacts,
     ) -> anyhow::Result<()>;
+
+    fn max_attempts(&self) -> u32;
+
+    /// Invoked in `wait_for_task` for in-progress job.
+    async fn get_job_attempts(&self, job_id: &Self::JobId) -> anyhow::Result<u32>;
 }

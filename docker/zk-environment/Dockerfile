@@ -1,4 +1,60 @@
-FROM ubuntu:20.04@sha256:3246518d9735254519e1b2ff35f95686e4a5011c90c85344c1f38df7bae9dd37 as base
+# Building solidity from sources so binary is available for any architecture
+FROM debian:bookworm as solidity-builder
+
+# Link Docker Image with repository
+# https://docs.github.com/en/packages/learn-github-packages/connecting-a-repository-to-a-package#connecting-a-repository-to-a-container-image-using-the-command-line
+LABEL org.opencontainers.image.source=https://github.com/matter-labs/zksync-era
+LABEL org.opencontainers.image.licenses="MIT OR Apache-2.0"
+
+# Install prerequisites
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    libboost-all-dev
+
+# Clone Solidity repository
+RUN git clone https://github.com/ethereum/solidity.git
+
+# Checkout specific version
+WORKDIR /solidity
+RUN git checkout v0.8.20
+
+# Initialize and update submodules
+RUN git submodule update --init --recursive
+
+# Build Solidity
+WORKDIR /solidity/build
+# The default compilation is Release with Debug symbols, which is quite large.
+RUN cmake .. -DCMAKE_BUILD_TYPE="Release"
+RUN make -j
+
+# Rust binaries - with a separate builder.
+FROM rust:slim-bookworm as rust-builder
+
+ARG ARCH=amd64
+RUN apt-get update && apt-get install -y \
+    libssl-dev \
+    pkg-config \
+    libclang-15-dev \
+    g++ \
+    cmake \
+    git
+
+RUN cargo install --version=0.8.0 sqlx-cli
+RUN cargo install cargo-nextest
+RUN cargo install cargo-spellcheck
+RUN cargo install sccache
+
+RUN git clone https://github.com/matter-labs/foundry-zksync
+RUN cd foundry-zksync && git reset --hard 27360d4c8d12beddbb730dae07ad33a206b38f4b && cargo build --release --bins
+RUN mv ./foundry-zksync/target/release/forge /usr/local/cargo/bin/
+RUN mv ./foundry-zksync/target/release/cast /usr/local/cargo/bin/
+
+# Main builder.
+FROM debian:bookworm as rust-lightweight-base
+
+ARG ARCH=amd64
 
 WORKDIR /usr/src/zksync
 ENV DEBIAN_FRONTEND noninteractive
@@ -19,177 +75,104 @@ RUN apt-get update && apt-get install -y \
     jq \
     openssh-server \
     openssh-client \
-    wget \
     vim \
     ca-certificates \
     gnupg2 \
     postgresql-client \
     wget \
-    bzip2
+    bzip2 \
+    hub \
+    unzip
 
-# Install dependencies for RocksDB. `liburing` is not available for Ubuntu 20.04,
-# so we use a PPA with the backport
-RUN add-apt-repository ppa:savoury1/virtualisation && \
-    apt-get update && \
+# Install dependencies for RocksDB.
+RUN apt-get update && \
     apt-get install -y \
-    curl \
     gnutls-bin git \
     build-essential \
-    clang-7 \
-    lldb-7 \
-    lld-7 \
-    liburing-dev
+    clang-15 \
+    lldb-15 \
+    lld-15 \
+    liburing-dev \
+    libclang-15-dev
 
-# Install docker engine
-RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
-RUN add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-RUN apt update; apt install -y docker-ce-cli
+# Install Docker
+RUN apt-get update && \
+    apt-get install ca-certificates gnupg && \
+    install -m 0755 -d /etc/apt/keyrings && \
+    wget -c -O - https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg && \
+    chmod a+r /etc/apt/keyrings/docker.gpg && \
+    echo \
+    "deb [arch="$(dpkg --print-architecture)" signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian \
+    "$(. /etc/os-release && echo "$VERSION_CODENAME")" stable" | \
+    tee /etc/apt/sources.list.d/docker.list > /dev/null && \
+    apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-# Configurate git to fetch submodules correctly (https://stackoverflow.com/questions/38378914/how-to-fix-git-error-rpc-failed-curl-56-gnutls)
-RUN git config --global http.postBuffer 1048576000
-
-# Install node and yarn
-RUN curl -sL https://deb.nodesource.com/setup_18.x | bash -
-RUN apt-get install -y nodejs
-RUN npm install -g yarn
+# Install Node and yarn
+ENV NODE_MAJOR=18
+RUN mkdir -p /etc/apt/keyrings && \
+    wget -c -O - https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list && \
+    apt-get update && apt-get install nodejs -y && \
+    npm install -g yarn
 
 # Install Rust and required cargo packages
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 
-ENV GCLOUD_VERSION=403.0.0
-# Install gloud for gcr login and gcfuze for mounting buckets
-RUN echo "deb http://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list && \
-    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add - && \
+# Install gloud for GCR/GAR login
+# Google was super lazy, and their package is around 1 GB.
+# So we trim it a little bit based on info from `https://github.com/GoogleCloudPlatform/gsutil/issues/1732`
+ENV GCLOUD_VERSION=451.0.1
+RUN echo "deb [arch=${ARCH}] http://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list && \
+    wget -c -O - https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add - && \
     apt-get update -y && apt-get install google-cloud-cli=${GCLOUD_VERSION}-0 --no-install-recommends -y && \
     gcloud config set core/disable_usage_reporting true && \
     gcloud config set component_manager/disable_update_check true && \
-    gcloud config set metrics/environment github_docker_image
+    gcloud config set metrics/environment github_docker_image && \
+    rm -rf $(find /usr/lib/google-cloud-sdk/ -regex ".*/__pycache__") && \
+    rm -rf /usr/lib/google-cloud-sdk/bin/anthoscli && \
+    rm -rf /usr/lib/google-cloud-sdk/platform/bundledpythonunix && \
+    rm -rf /usr/lib/google-cloud-sdk/data/gcloud.json
 
-RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
-RUN rustup install nightly-2023-07-21
-RUN rustup default stable
-RUN cargo install --version=0.5.13 sqlx-cli
-RUN cargo install cargo-tarpaulin
-RUN cargo install cargo-nextest
-
+COPY --from=rust-builder /usr/local/cargo/bin/sqlx \
+    /usr/local/cargo/bin/cargo-sqlx \
+    /usr/local/cargo/bin/cargo-nextest \
+    /usr/local/cargo/bin/cargo-spellcheck \
+    /usr/local/cargo/bin/sccache \
+    /usr/local/cargo/bin/forge \
+    /usr/local/cargo/bin/cast /usr/local/cargo/bin/
+    
 # Copy compiler (both solc and zksolc) binaries
 # Obtain `solc` 0.8.20.
-RUN wget https://github.com/ethereum/solc-bin/raw/gh-pages/linux-amd64/solc-linux-amd64-v0.8.20%2Bcommit.a1b79de6 \
-    && mv solc-linux-amd64-v0.8.20+commit.a1b79de6 /usr/bin/solc \
-    && chmod +x /usr/bin/solc
-# Obtain `zksolc` 1.3.13.
-RUN wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.13 \
-    && mv zksolc-linux-amd64-musl-v1.3.13 /usr/bin/zksolc \
+COPY --from=solidity-builder /solidity/build/solc/solc /usr/bin/
+RUN chmod +x /usr/bin/solc
+# Obtain `zksolc` 1.3.16.
+RUN wget -c https://github.com/matter-labs/zksolc-bin/raw/main/linux-${ARCH}/zksolc-linux-${ARCH}-musl-v1.3.16 \
+    && mv zksolc-linux-${ARCH}-musl-v1.3.16 /usr/bin/zksolc \
     && chmod +x /usr/bin/zksolc
 
 # Somehow it is installed with some other packages
 RUN apt-get remove valgrind -y
 
 # We need valgrind 3.20, which is unavailable in repos or ppa, so we will build it from source
-RUN wget https://sourceware.org/pub/valgrind/valgrind-3.20.0.tar.bz2 && \
+RUN wget -c https://sourceware.org/pub/valgrind/valgrind-3.20.0.tar.bz2 && \
     tar -xf valgrind-3.20.0.tar.bz2 && \
-    cd valgrind-3.20.0 && ./configure && make && make install && \
+    cd valgrind-3.20.0 && ./configure && make -j && make install && \
     cd ../ && rm -rf valgrind-3.20.0.tar.bz2 && rm -rf valgrind-3.20.0
 
-# Setup the environment
-ENV ZKSYNC_HOME=/usr/src/zksync
-ENV PATH="${ZKSYNC_HOME}/bin:${PATH}"
-ENV CI=1
-RUN cargo install sccache
-ENV RUSTC_WRAPPER=/usr/local/cargo/bin/sccache
-
-FROM base as nvidia-tools
-
-# Install Rust and required cargo packages
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
 
 # Setup the environment
 ENV ZKSYNC_HOME=/usr/src/zksync
-ENV PATH="${ZKSYNC_HOME}/bin:${PATH}"
+ENV PATH="${ZKSYNC_HOME}/bin:${ZKSYNC_HOME}/zkstack_cli/zkstackup:${HOME}/.local/bin:${PATH}"
 ENV CI=1
 ENV RUSTC_WRAPPER=/usr/local/cargo/bin/sccache
-ENV DEBIAN_FRONTEND noninteractive
 
-# Setup nvidia-cuda env
-ENV NVARCH x86_64
+# If target is 'main' - then install default rust.
+FROM rust-lightweight-base as rust-lightweight
+RUN wget -c -O - https://sh.rustup.rs | bash -s -- -y
 
-ENV NVIDIA_REQUIRE_CUDA "cuda>=11.8 brand=tesla,driver>=450,driver<451 brand=tesla,driver>=470,driver<471 brand=unknown,driver>=470,driver<471 brand=nvidia,driver>=470,driver<471 brand=nvidiartx,driver>=470,driver<471 brand=quadrortx,driver>=470,driver<471 brand=unknown,driver>=510,driver<511 brand=nvidia,driver>=510,driver<511 brand=nvidiartx,driver>=510,driver<511 brand=quadrortx,driver>=510,driver<511 brand=unknown,driver>=515,driver<516 brand=nvidia,driver>=515,driver<516 brand=nvidiartx,driver>=515,driver<516 brand=quadrortx,driver>=515,driver<516"
-ENV NV_CUDA_CUDART_VERSION 11.8.89-1
-ENV NV_CUDA_COMPAT_PACKAGE cuda-compat-11-8
 
-RUN curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/${NVARCH}/3bf863cc.pub | apt-key add - && \
-    echo "deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/${NVARCH} /" > /etc/apt/sources.list.d/cuda.list
-
-ENV CUDA_VERSION 11.8.0
-
-# For libraries in the cuda-compat-* package: https://docs.nvidia.com/cuda/eula/index.html#attachment-a
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    cuda-cudart-11-8=${NV_CUDA_CUDART_VERSION} \
-    ${NV_CUDA_COMPAT_PACKAGE} \
-    && ln -s cuda-11.8 /usr/local/cuda && \
-    rm -rf /var/lib/apt/lists/*
-
-# Required for nvidia-docker v1
-RUN echo "/usr/local/nvidia/lib" >> /etc/ld.so.conf.d/nvidia.conf \
-    && echo "/usr/local/nvidia/lib64" >> /etc/ld.so.conf.d/nvidia.conf
-
-ENV PATH /usr/local/nvidia/bin:/usr/local/cuda/bin:${PATH}
-ENV LD_LIBRARY_PATH /usr/local/nvidia/lib:/usr/local/nvidia/lib64
-
-# nvidia-container-runtime
-ENV NVIDIA_VISIBLE_DEVICES all
-ENV NVIDIA_DRIVER_CAPABILITIES compute,utility
-
-ENV NV_CUDA_LIB_VERSION 11.8.0-1
-
-ENV NV_NVTX_VERSION 11.8.86-1
-ENV NV_LIBNPP_VERSION 11.8.0.86-1
-ENV NV_LIBNPP_PACKAGE libnpp-11-8=${NV_LIBNPP_VERSION}
-ENV NV_LIBCUSPARSE_VERSION 11.7.5.86-1
-
-ENV NV_LIBCUBLAS_PACKAGE_NAME libcublas-11-8
-ENV NV_LIBCUBLAS_VERSION 11.11.3.6-1
-ENV NV_LIBCUBLAS_PACKAGE ${NV_LIBCUBLAS_PACKAGE_NAME}=${NV_LIBCUBLAS_VERSION}
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    cuda-libraries-11-8=${NV_CUDA_LIB_VERSION} \
-    ${NV_LIBNPP_PACKAGE} \
-    cuda-nvtx-11-8=${NV_NVTX_VERSION} \
-    libcusparse-11-8=${NV_LIBCUSPARSE_VERSION} \
-    ${NV_LIBCUBLAS_PACKAGE} \
-    && rm -rf /var/lib/apt/lists/*
-
-# Keep apt from auto upgrading the cublas and nccl packages. See https://gitlab.com/nvidia/container-images/cuda/-/issues/88
-RUN apt-mark hold ${NV_LIBCUBLAS_PACKAGE_NAME}
-
-ENV NV_CUDA_CUDART_DEV_VERSION 11.8.89-1
-ENV NV_NVML_DEV_VERSION 11.8.86-1
-ENV NV_LIBCUSPARSE_DEV_VERSION 11.7.5.86-1
-ENV NV_LIBNPP_DEV_VERSION 11.8.0.86-1
-ENV NV_LIBNPP_DEV_PACKAGE libnpp-dev-11-8=${NV_LIBNPP_DEV_VERSION}
-
-ENV NV_LIBCUBLAS_DEV_VERSION 11.11.3.6-1
-ENV NV_LIBCUBLAS_DEV_PACKAGE_NAME libcublas-dev-11-8
-ENV NV_LIBCUBLAS_DEV_PACKAGE ${NV_LIBCUBLAS_DEV_PACKAGE_NAME}=${NV_LIBCUBLAS_DEV_VERSION}
-
-ENV NV_NVPROF_VERSION 11.8.87-1
-ENV NV_NVPROF_DEV_PACKAGE cuda-nvprof-11-8=${NV_NVPROF_VERSION}
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libtinfo5 libncursesw5 \
-    cuda-cudart-dev-11-8=${NV_CUDA_CUDART_DEV_VERSION} \
-    cuda-command-line-tools-11-8=${NV_CUDA_LIB_VERSION} \
-    cuda-minimal-build-11-8=${NV_CUDA_LIB_VERSION} \
-    cuda-libraries-dev-11-8=${NV_CUDA_LIB_VERSION} \
-    cuda-nvml-dev-11-8=${NV_NVML_DEV_VERSION} \
-    ${NV_NVPROF_DEV_PACKAGE} \
-    ${NV_LIBNPP_DEV_PACKAGE} \
-    libcusparse-dev-11-8=${NV_LIBCUSPARSE_DEV_VERSION} \
-    ${NV_LIBCUBLAS_DEV_PACKAGE} \
-    && rm -rf /var/lib/apt/lists/*
-
-ENV LIBRARY_PATH /usr/local/cuda/lib64/stubs
+# If target is nightly - then install only nightly rust.
+FROM rust-lightweight-base as rust-lightweight-nightly
+RUN wget -c -O - https://sh.rustup.rs | bash -s -- -y --default-toolchain nightly-2024-08-01

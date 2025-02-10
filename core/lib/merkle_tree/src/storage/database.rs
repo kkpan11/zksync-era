@@ -1,11 +1,11 @@
 //! `Database` trait and its implementations.
 
-use std::ops;
+use std::{any::Any, ops};
 
 use crate::{
     errors::DeserializeError,
     storage::patch::PatchSet,
-    types::{Manifest, Node, NodeKey, Root},
+    types::{Manifest, Node, NodeKey, ProfiledTreeOperation, Root},
 };
 
 /// Slice of node keys together with an indicator whether a node at the requested key is a leaf.
@@ -77,8 +77,15 @@ pub trait Database: Send + Sync {
             .unwrap_or_else(|err| panic!("{err}"))
     }
 
+    /// Starts profiling I/O operations and returns a thread-local guard to be dropped when profiling should be finished.
+    fn start_profiling(&self, operation: ProfiledTreeOperation) -> Box<dyn Any>;
+
     /// Applies changes in the `patch` to this database. This operation should be atomic.
-    fn apply_patch(&mut self, patch: PatchSet);
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors.
+    fn apply_patch(&mut self, patch: PatchSet) -> anyhow::Result<()>;
 }
 
 impl<DB: Database + ?Sized> Database for &mut DB {
@@ -98,8 +105,16 @@ impl<DB: Database + ?Sized> Database for &mut DB {
         (**self).try_tree_node(key, is_leaf)
     }
 
-    fn apply_patch(&mut self, patch: PatchSet) {
-        (**self).apply_patch(patch);
+    fn tree_nodes(&self, keys: &NodeKeys) -> Vec<Option<Node>> {
+        (**self).tree_nodes(keys)
+    }
+
+    fn start_profiling(&self, operation: ProfiledTreeOperation) -> Box<dyn Any> {
+        (**self).start_profiling(operation)
+    }
+
+    fn apply_patch(&mut self, patch: PatchSet) -> anyhow::Result<()> {
+        (**self).apply_patch(patch)
     }
 }
 
@@ -109,7 +124,10 @@ impl Database for PatchSet {
     }
 
     fn try_root(&self, version: u64) -> Result<Option<Root>, DeserializeError> {
-        Ok(self.roots.get(&version).cloned())
+        let Some(patch) = self.patches_by_version.get(&version) else {
+            return Ok(None);
+        };
+        Ok(patch.root.clone())
     }
 
     fn try_tree_node(
@@ -117,10 +135,8 @@ impl Database for PatchSet {
         key: &NodeKey,
         is_leaf: bool,
     ) -> Result<Option<Node>, DeserializeError> {
-        let node = self
-            .nodes_by_version
-            .get(&key.version)
-            .and_then(|nodes| nodes.get(key));
+        let patch_with_node = self.patches_by_version.get(&key.version);
+        let node = patch_with_node.and_then(|patch| patch.nodes.get(key));
         let Some(node) = node.cloned() else {
             return Ok(None);
         };
@@ -134,21 +150,49 @@ impl Database for PatchSet {
         Ok(Some(node))
     }
 
-    fn apply_patch(&mut self, other: PatchSet) {
+    fn start_profiling(&self, _operation: ProfiledTreeOperation) -> Box<dyn Any> {
+        Box::new(()) // no stats are collected
+    }
+
+    fn apply_patch(&mut self, mut other: PatchSet) -> anyhow::Result<()> {
+        if let Some(other_updated_version) = other.updated_version {
+            if let Some(updated_version) = self.updated_version {
+                anyhow::ensure!(
+                    other_updated_version == updated_version,
+                    "Cannot merge patches with different updated versions"
+                );
+
+                let patch = self.patches_by_version.get_mut(&updated_version).unwrap();
+                let other_patch = other.patches_by_version.remove(&updated_version).unwrap();
+                // ^ `unwrap()`s are safe by design.
+                patch.merge(other_patch);
+            } else {
+                anyhow::ensure!(
+                    self.patches_by_version.keys().all(|&ver| ver > other_updated_version),
+                    "Cannot update {self:?} from {other:?}; this would break the update version invariant \
+                     (the update version being lesser than all inserted versions)"
+                );
+                self.updated_version = Some(other_updated_version);
+            }
+        }
+
         let new_version_count = other.manifest.version_count;
         if new_version_count < self.manifest.version_count {
-            // Remove obsolete roots and nodes from the patch.
-            self.roots.retain(|&version, _| version < new_version_count);
-            self.nodes_by_version
-                .retain(|&version, _| version < new_version_count);
-            self.stale_keys_by_version
+            // Remove obsolete sub-patches from the patch.
+            self.patches_by_version
                 .retain(|&version, _| version < new_version_count);
         }
         self.manifest = other.manifest;
-        self.roots.extend(other.roots);
-        self.nodes_by_version.extend(other.nodes_by_version);
-        self.stale_keys_by_version
-            .extend(other.stale_keys_by_version);
+        self.patches_by_version.extend(other.patches_by_version);
+        for (version, stale_keys) in other.stale_keys_by_version {
+            self.stale_keys_by_version
+                .entry(version)
+                .or_default()
+                .extend(stale_keys);
+        }
+        // `PatchSet` invariants hold by construction: the updated version (if set) is still lower
+        // than all other versions by design.
+        Ok(())
     }
 }
 
@@ -170,9 +214,33 @@ impl<DB: Database> Patched<DB> {
     }
 
     pub(crate) fn patched_versions(&self) -> Vec<u64> {
-        self.patch
-            .as_ref()
-            .map_or_else(Vec::new, |patch| patch.roots.keys().copied().collect())
+        self.patch.as_ref().map_or_else(Vec::new, |patch| {
+            patch.patches_by_version.keys().copied().collect()
+        })
+    }
+
+    /// Returns the value from the patch and a flag whether this value is final (i.e., a DB lookup
+    /// is not required).
+    fn lookup_patch(&self, key: &NodeKey, is_leaf: bool) -> (Option<Node>, bool) {
+        let Some(patch) = &self.patch else {
+            return (None, false);
+        };
+        if patch.is_new_version(key.version) {
+            return (patch.tree_node(key, is_leaf), true);
+        }
+        let could_be_in_updated_patch = patch.updated_version == Some(key.version);
+        if could_be_in_updated_patch {
+            // Unlike with new versions, we must look both in the update patch and in the original DB.
+            if let Some(node) = patch.tree_node(key, is_leaf) {
+                return (Some(node), true);
+            }
+        }
+        (None, false)
+    }
+
+    /// Provides readonly access to the wrapped DB.
+    pub(crate) fn inner(&self) -> &DB {
+        &self.inner
     }
 
     /// Provides access to the wrapped DB. Should not be used to mutate DB data.
@@ -181,10 +249,15 @@ impl<DB: Database> Patched<DB> {
     }
 
     /// Flushes changes from RAM to the wrapped database.
-    pub fn flush(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Proxies database I/O errors.
+    pub fn flush(&mut self) -> anyhow::Result<()> {
         if let Some(patch) = self.patch.take() {
-            self.inner.apply_patch(patch);
+            self.inner.apply_patch(patch)?;
         }
+        Ok(())
     }
 
     /// Forgets about changes held in RAM.
@@ -218,8 +291,9 @@ impl<DB: Database> Database for Patched<DB> {
 
     fn try_root(&self, version: u64) -> Result<Option<Root>, DeserializeError> {
         if let Some(patch) = &self.patch {
-            if patch.is_responsible_for_version(version) {
-                return Ok(patch.roots.get(&version).cloned());
+            let has_root = patch.is_new_version(version) || patch.updated_version == Some(version);
+            if has_root {
+                return patch.try_root(version);
             }
         }
         self.inner.try_root(version)
@@ -230,32 +304,41 @@ impl<DB: Database> Database for Patched<DB> {
         key: &NodeKey,
         is_leaf: bool,
     ) -> Result<Option<Node>, DeserializeError> {
-        let Some(patch) = &self.patch else {
-            return self.inner.try_tree_node(key, is_leaf);
-        };
-
-        if patch.is_responsible_for_version(key.version) {
-            patch.try_tree_node(key, is_leaf) // take use of debug assertions
+        let (patch_node, is_final) = self.lookup_patch(key, is_leaf);
+        if is_final {
+            Ok(patch_node)
+        } else if let Some(node) = patch_node {
+            Ok(Some(node))
         } else {
             self.inner.try_tree_node(key, is_leaf)
         }
     }
 
     fn tree_nodes(&self, keys: &NodeKeys) -> Vec<Option<Node>> {
-        let Some(patch) = &self.patch else {
+        if self.patch.is_none() {
             return self.inner.tree_nodes(keys);
-        };
+        }
 
-        let mut is_in_patch = Vec::with_capacity(keys.len());
-        let (patch_keys, db_keys): (Vec<_>, Vec<_>) = keys.iter().partition(|(key, _)| {
-            let flag = patch.is_responsible_for_version(key.version);
-            is_in_patch.push(flag);
-            flag
-        });
+        let mut is_in_patch = vec![false; keys.len()];
+        let mut patch_values = vec![];
+        for (i, (key, is_leaf)) in keys.iter().enumerate() {
+            let (patch_node, is_final) = self.lookup_patch(key, *is_leaf);
+            if is_final {
+                patch_values.push(patch_node);
+                is_in_patch[i] = true;
+            } else if let Some(node) = patch_node {
+                patch_values.push(Some(node));
+                is_in_patch[i] = true;
+            }
+        }
+        let db_keys: Vec<_> = keys
+            .iter()
+            .zip(&is_in_patch)
+            .filter_map(|(&key, &is_in_patch)| (!is_in_patch).then_some(key))
+            .collect();
 
-        let mut patch_values = patch.tree_nodes(&patch_keys).into_iter();
+        let mut patch_values = patch_values.into_iter();
         let mut db_values = self.inner.tree_nodes(&db_keys).into_iter();
-
         let values = is_in_patch.into_iter().map(|is_in_patch| {
             if is_in_patch {
                 patch_values.next().unwrap()
@@ -266,12 +349,17 @@ impl<DB: Database> Database for Patched<DB> {
         values.collect()
     }
 
-    fn apply_patch(&mut self, patch: PatchSet) {
+    fn start_profiling(&self, operation: ProfiledTreeOperation) -> Box<dyn Any> {
+        self.inner.start_profiling(operation)
+    }
+
+    fn apply_patch(&mut self, patch: PatchSet) -> anyhow::Result<()> {
         if let Some(existing_patch) = &mut self.patch {
-            existing_patch.apply_patch(patch);
+            existing_patch.apply_patch(patch)?;
         } else {
             self.patch = Some(patch);
         }
+        Ok(())
     }
 }
 
@@ -307,7 +395,22 @@ pub trait PruneDatabase: Database {
     fn stale_keys(&self, version: u64) -> Vec<NodeKey>;
 
     /// Atomically prunes the tree and updates information about the minimum retained version.
-    fn prune(&mut self, patch: PrunePatchSet);
+    ///
+    /// # Errors
+    ///
+    /// Propagates database I/O errors.
+    fn prune(&mut self, patch: PrunePatchSet) -> anyhow::Result<()>;
+
+    /// Atomically truncates the specified range of versions and stale keys.
+    ///
+    /// # Errors
+    ///
+    /// Propagates database I/O errors.
+    fn truncate(
+        &mut self,
+        manifest: Manifest,
+        truncated_versions: ops::RangeTo<u64>,
+    ) -> anyhow::Result<()>;
 }
 
 impl<T: PruneDatabase + ?Sized> PruneDatabase for &mut T {
@@ -319,8 +422,16 @@ impl<T: PruneDatabase + ?Sized> PruneDatabase for &mut T {
         (**self).stale_keys(version)
     }
 
-    fn prune(&mut self, patch: PrunePatchSet) {
-        (**self).prune(patch);
+    fn prune(&mut self, patch: PrunePatchSet) -> anyhow::Result<()> {
+        (**self).prune(patch)
+    }
+
+    fn truncate(
+        &mut self,
+        manifest: Manifest,
+        truncated_versions: ops::RangeTo<u64>,
+    ) -> anyhow::Result<()> {
+        (**self).truncate(manifest, truncated_versions)
     }
 }
 
@@ -339,17 +450,32 @@ impl PruneDatabase for PatchSet {
             .unwrap_or_default()
     }
 
-    fn prune(&mut self, patch: PrunePatchSet) {
+    fn prune(&mut self, patch: PrunePatchSet) -> anyhow::Result<()> {
         for key in &patch.pruned_node_keys {
+            let Some(patch) = self.patches_by_version.get_mut(&key.version) else {
+                continue;
+            };
             if key.is_empty() {
-                self.roots.remove(&key.version);
-            } else if let Some(nodes) = self.nodes_by_version.get_mut(&key.version) {
-                nodes.remove(key);
+                patch.root = None;
+            } else {
+                patch.nodes.remove(key);
             }
         }
 
         self.stale_keys_by_version
             .retain(|version, _| !patch.deleted_stale_key_versions.contains(version));
+        Ok(())
+    }
+
+    fn truncate(
+        &mut self,
+        manifest: Manifest,
+        truncated_versions: ops::RangeTo<u64>,
+    ) -> anyhow::Result<()> {
+        self.manifest = manifest;
+        self.stale_keys_by_version
+            .retain(|version, _| !truncated_versions.contains(version));
+        Ok(())
     }
 }
 
@@ -359,9 +485,96 @@ mod tests {
 
     use super::*;
     use crate::{
-        storage::tests::{create_patch, generate_nodes, FIRST_KEY},
+        storage::{
+            tests::{create_patch, generate_nodes, FIRST_KEY},
+            Operation,
+        },
         types::{InternalNode, Nibbles},
     };
+
+    #[test]
+    fn patch_set_with_update() {
+        let manifest = Manifest::new(10, &());
+        let old_root = Root::new(2, Node::Internal(InternalNode::default()));
+        let nodes = generate_nodes(9, &[1, 2]);
+        let mut patch = PatchSet::new(
+            manifest,
+            9,
+            old_root.clone(),
+            nodes.clone(),
+            vec![],
+            Operation::Update,
+        );
+
+        for ver in (0..9).chain(10..20) {
+            assert!(patch.root(ver).is_none());
+        }
+        assert_eq!(patch.root(9).unwrap(), old_root);
+        let (&node_key, expected_node) = nodes.iter().next().unwrap();
+        let node = patch.tree_node(&node_key, true).unwrap();
+        assert_eq!(node, *expected_node);
+
+        let new_nodes = generate_nodes(10, &[3, 4]);
+        let manifest = Manifest::new(11, &());
+        let new_root = Root::new(4, Node::Internal(InternalNode::default()));
+        let new_patch = PatchSet::new(
+            manifest,
+            10,
+            new_root.clone(),
+            new_nodes.clone(),
+            vec![],
+            Operation::Insert,
+        );
+        patch.apply_patch(new_patch).unwrap();
+
+        for ver in (0..9).chain(11..20) {
+            assert!(patch.root(ver).is_none());
+        }
+        assert_eq!(patch.root(9).unwrap(), old_root);
+        assert_eq!(patch.root(10).unwrap(), new_root);
+        let (&node_key, expected_node) = nodes.iter().next().unwrap();
+        let node = patch.tree_node(&node_key, true).unwrap();
+        assert_eq!(node, *expected_node);
+        let (&node_key, expected_node) = new_nodes.iter().next().unwrap();
+        let node = patch.tree_node(&node_key, true).unwrap();
+        assert_eq!(node, *expected_node);
+    }
+
+    #[test]
+    fn merging_two_update_patches() {
+        let manifest = Manifest::new(10, &());
+        let old_root = Root::new(2, Node::Internal(InternalNode::default()));
+        let nodes = generate_nodes(9, &[1, 2]);
+        let mut patch = PatchSet::new(
+            manifest.clone(),
+            9,
+            old_root,
+            nodes.clone(),
+            vec![],
+            Operation::Update,
+        );
+
+        let new_nodes = generate_nodes(9, &[3, 4]);
+        let new_root = Root::new(4, Node::Internal(InternalNode::default()));
+        let new_patch = PatchSet::new(
+            manifest,
+            9,
+            new_root.clone(),
+            new_nodes.clone(),
+            vec![],
+            Operation::Update,
+        );
+        patch.apply_patch(new_patch).unwrap();
+
+        for ver in (0..9).chain(10..20) {
+            assert!(patch.root(ver).is_none());
+        }
+        assert_eq!(patch.root(9).unwrap(), new_root);
+        for (&node_key, expected_node) in nodes.iter().chain(&new_nodes) {
+            let node = patch.tree_node(&node_key, true).unwrap();
+            assert_eq!(node, *expected_node);
+        }
+    }
 
     #[test]
     fn requesting_nodes_in_patched_db() {
@@ -375,7 +588,7 @@ mod tests {
         let new_root = Root::new(3, Node::Internal(InternalNode::default()));
         let new_nodes = generate_nodes(1, &[3, 4, 5]);
         let patch = create_patch(1, new_root, new_nodes.clone());
-        patched.apply_patch(patch);
+        patched.apply_patch(patch).unwrap();
 
         let (&old_key, expected_node) = old_nodes.iter().next().unwrap();
         let node = patched.tree_node(&old_key, true).unwrap();
@@ -425,5 +638,56 @@ mod tests {
             nodes.as_slice(),
             [Some(_), Some(_), None, None, None, None, Some(_), Some(_), Some(_)]
         );
+    }
+
+    #[test]
+    fn patched_db_with_update_patch() {
+        let manifest = Manifest::new(10, &());
+        let old_root = Root::new(2, Node::Internal(InternalNode::default()));
+        let nodes = generate_nodes(9, &[1, 2]);
+        let db = PatchSet::new(
+            manifest.clone(),
+            9,
+            old_root.clone(),
+            nodes.clone(),
+            vec![],
+            Operation::Update,
+        );
+        let mut patched = Patched::new(db);
+
+        let new_nodes = generate_nodes(9, &[3, 4]);
+        let new_root = Root::new(4, Node::Internal(InternalNode::default()));
+        let new_patch = PatchSet::new(
+            manifest,
+            9,
+            new_root.clone(),
+            new_nodes.clone(),
+            vec![],
+            Operation::Update,
+        );
+        patched.apply_patch(new_patch).unwrap();
+
+        for ver in (0..9).chain(10..20) {
+            assert!(patched.root(ver).is_none());
+        }
+        assert_eq!(patched.root(9).unwrap(), new_root);
+        for (&node_key, expected_node) in nodes.iter().chain(&new_nodes) {
+            let node = patched.tree_node(&node_key, true).unwrap();
+            assert_eq!(node, *expected_node);
+        }
+
+        let requested_keys: Vec<_> = nodes
+            .keys()
+            .chain(new_nodes.keys())
+            .map(|&key| (key, true))
+            .collect();
+        let retrieved_nodes = patched.tree_nodes(&requested_keys);
+        assert_eq!(retrieved_nodes.len(), requested_keys.len());
+        for ((key, _), node) in requested_keys.iter().zip(retrieved_nodes) {
+            assert_eq!(
+                node.unwrap(),
+                *nodes.get(key).unwrap_or_else(|| &new_nodes[key])
+            );
+        }
     }
 }

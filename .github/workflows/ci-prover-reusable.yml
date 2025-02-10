@@ -3,53 +3,83 @@ on:
   workflow_call:
 
 jobs:
-  unit-tests:
-    runs-on: [matterlabs-ci-runner]
+  lint:
+    runs-on: [ matterlabs-ci-runner-highmem-long ]
+    env:
+      RUNNER_COMPOSE_FILE: "docker-compose-runner-nightly.yml"
 
     steps:
-      - name: Prepare environment
-        run: |
-          sudo apt update && sudo apt install -y \
-            pkg-config libclang-dev build-essential lldb lld \
-            clang openssl libssl-dev gcc g++ pkg-config libclang-dev curl wget 
-
-      - uses: actions/checkout@ac593985615ec2ede58e132d2e21d2b1cbd6127c # v3
+      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4
         with:
           submodules: "recursive"
-
-      - name: Use Node.js 18.18.0
-        uses: actions/setup-node@v2
-        with:
-          node-version: '18.18.0'
-
-      - name: Install Rust nightly-2023-07-21
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly-2023-07-21
-          override: true
 
       - name: Setup environment
         run: |
           echo ZKSYNC_HOME=$(pwd) >> $GITHUB_ENV
           echo $(pwd)/bin >> $GITHUB_PATH
           echo IN_DOCKER=1 >> .env
-          npm install -g yarn
-          cargo install sqlx-cli --version 0.5.13
+          echo "SCCACHE_GCS_BUCKET=matterlabs-infra-sccache-storage" >> .env
+          echo "SCCACHE_GCS_SERVICE_ACCOUNT=gha-ci-runners@matterlabs-infra.iam.gserviceaccount.com" >> .env
+          echo "SCCACHE_GCS_RW_MODE=READ_WRITE" >> .env
+          echo "RUSTC_WRAPPER=sccache" >> .env
+          echo "prover_url=postgres://postgres:notsecurepassword@localhost:5432/zksync_local_prover" >> $GITHUB_ENV
+          echo "core_url=postgres://postgres:notsecurepassword@localhost:5432/zksync_local" >> $GITHUB_ENV
 
       - name: Start services
         run: |
-          docker-compose -f docker-compose-runner.yml pull
-          docker-compose -f docker-compose-runner.yml up --build -d zk
-          ci_run sccache --start-server
+          run_retried docker-compose -f ${RUNNER_COMPOSE_FILE} pull
+          docker-compose -f ${RUNNER_COMPOSE_FILE} up --build -d zk postgres
+
+      - name: Install zkstack
+        run: |
+          ci_run ./zkstack_cli/zkstackup/install -g --path ./zkstack_cli/zkstackup/zkstackup
+          ci_run zkstackup -g --local
+
+      - name: Database setup
+        run: |
+          ci_run zkstack dev db setup --prover-url=${{ env.prover_url }} --core-url=${{ env.core_url }}
+
+      - name: Formatting
+        run: |
+          ci_run git config --global --add safe.directory /usr/src/zksync
+          ci_run zkstack dev fmt --check rustfmt
+
+  unit-tests:
+    runs-on: [ matterlabs-ci-runner-highmem-long ]
+    env:
+      RUNNER_COMPOSE_FILE: "docker-compose-runner-nightly.yml"
+
+    steps:
+      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4
+        with:
+          submodules: "recursive"
+
+      - name: Setup environment
+        run: |
+          echo ZKSYNC_HOME=$(pwd) >> $GITHUB_ENV
+          echo $(pwd)/bin >> $GITHUB_PATH
+          echo IN_DOCKER=1 >> .env
+          echo "SCCACHE_GCS_BUCKET=matterlabs-infra-sccache-storage" >> .env
+          echo "SCCACHE_GCS_SERVICE_ACCOUNT=gha-ci-runners@matterlabs-infra.iam.gserviceaccount.com" >> .env
+          echo "SCCACHE_GCS_RW_MODE=READ_WRITE" >> .env
+          echo "RUSTC_WRAPPER=sccache" >> .env
+          echo "ZKSYNC_USE_CUDA_STUBS=true" >> .env
+
+      - name: Start services
+        run: |
+          run_retried docker-compose -f ${RUNNER_COMPOSE_FILE} pull
+          docker-compose -f ${RUNNER_COMPOSE_FILE} up --build -d zk postgres
+
+      - name: Install zkstack
+        run: |
+          ci_run ./zkstack_cli/zkstackup/install -g --path ./zkstack_cli/zkstackup/zkstackup || true
+          ci_run zkstackup -g --local
 
       - name: Init
         run: |
-          zk
-          zk config compile
-          zk db setup
+          ci_run run_retried rustup show
 
       - name: Prover unit tests
         run: |
-          cd prover
-          # Not all tests are enabled since, prover and setup_key_generator_and_server requires bellman-cuda to be present
-          zk f cargo +nightly-2023-07-21 test --release -p zksync_witness_generator -p vk_setup_data_generator_server_fri -p zksync_prover_fri -p zksync_witness_vector_generator -p zksync_prover_fri_utils
+          # Not all tests are enabled, since prover and setup_key_generator_and_server requires bellman-cuda to be present
+          ci_run zkstack dev test prover

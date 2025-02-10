@@ -1,86 +1,82 @@
 # syntax=docker/dockerfile:experimental
-FROM rust:1.72-bookworm as builder
-RUN apt-get update && apt-get install -y clang && rm -rf /var/lib/apt/lists/*
+FROM ghcr.io/matter-labs/zksync-build-base:latest AS builder
+
+ARG CUDA_ARCH=89
+ENV CUDAARCHS=${CUDA_ARCH}
+# set of args for use of sccache
+ARG SCCACHE_GCS_BUCKET=""
+ARG SCCACHE_GCS_SERVICE_ACCOUNT=""
+ARG SCCACHE_GCS_RW_MODE=""
+ARG RUSTC_WRAPPER=""
+
+ENV SCCACHE_GCS_BUCKET=${SCCACHE_GCS_BUCKET}
+ENV SCCACHE_GCS_SERVICE_ACCOUNT=${SCCACHE_GCS_SERVICE_ACCOUNT}
+ENV SCCACHE_GCS_RW_MODE=${SCCACHE_GCS_RW_MODE}
+ENV RUSTC_WRAPPER=${RUSTC_WRAPPER}
+
 WORKDIR /usr/src/zksync
 COPY . .
-#Needed to get zkEVM package from github link with auth embedded
-# Doesn't expected to work local
-RUN CARGO_HOME=./cargo cargo build --release
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y curl libpq5 ca-certificates wget python3 && rm -rf /var/lib/apt/lists/*
+RUN cargo build --manifest-path ./core/Cargo.toml --release --bin zksync_contract_verifier
 
-# install zksolc
-RUN mkdir -p /etc/zksolc-bin/v1.3.0 \
-    && wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.0 \
-    && mv zksolc-linux-amd64-musl-v1.3.0 /etc/zksolc-bin/v1.3.0/zksolc \
-    && chmod +x /etc/zksolc-bin/v1.3.0/zksolc
-RUN mkdir -p /etc/zksolc-bin/v1.3.1 \
-    && wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.1 \
-    && mv zksolc-linux-amd64-musl-v1.3.1 /etc/zksolc-bin/v1.3.1/zksolc \
-    && chmod +x /etc/zksolc-bin/v1.3.1/zksolc
-RUN mkdir -p /etc/zksolc-bin/v1.3.2 \
-    && wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.2 \
-    && mv zksolc-linux-amd64-musl-v1.3.2 /etc/zksolc-bin/v1.3.2/zksolc \
-    && chmod +x /etc/zksolc-bin/v1.3.2/zksolc
-RUN mkdir -p /etc/zksolc-bin/v1.3.3 \
-    && wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.3 \
-    && mv zksolc-linux-amd64-musl-v1.3.3 /etc/zksolc-bin/v1.3.3/zksolc \
-    && chmod +x /etc/zksolc-bin/v1.3.3/zksolc
-RUN mkdir -p /etc/zksolc-bin/v1.3.4 \
-    && wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.4 \
-    && mv zksolc-linux-amd64-musl-v1.3.4 /etc/zksolc-bin/v1.3.4/zksolc \
-    && chmod +x /etc/zksolc-bin/v1.3.4/zksolc
-RUN mkdir -p /etc/zksolc-bin/v1.3.5 \
-    && wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.5 \
-    && mv zksolc-linux-amd64-musl-v1.3.5 /etc/zksolc-bin/v1.3.5/zksolc \
-    && chmod +x /etc/zksolc-bin/v1.3.5/zksolc
-RUN mkdir -p /etc/zksolc-bin/v1.3.6 \
-    && wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.6 \
-    && mv zksolc-linux-amd64-musl-v1.3.6 /etc/zksolc-bin/v1.3.6/zksolc \
-    && chmod +x /etc/zksolc-bin/v1.3.6/zksolc
-RUN mkdir -p /etc/zksolc-bin/v1.3.7 \
-    && wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.7 \
-    && mv zksolc-linux-amd64-musl-v1.3.7 /etc/zksolc-bin/v1.3.7/zksolc \
-    && chmod +x /etc/zksolc-bin/v1.3.7/zksolc
-RUN mkdir -p /etc/zksolc-bin/v1.3.8 \
-    && wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.8 \
-    && mv zksolc-linux-amd64-musl-v1.3.8 /etc/zksolc-bin/v1.3.8/zksolc \
-    && chmod +x /etc/zksolc-bin/v1.3.8/zksolc
-RUN mkdir -p /etc/zksolc-bin/v1.3.9 \
-    && wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.9 \
-    && mv zksolc-linux-amd64-musl-v1.3.9 /etc/zksolc-bin/v1.3.9/zksolc \
-    && chmod +x /etc/zksolc-bin/v1.3.9/zksolc
-RUN mkdir -p /etc/zksolc-bin/v1.3.10 \
-    && wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.10 \
-    && mv zksolc-linux-amd64-musl-v1.3.10 /etc/zksolc-bin/v1.3.10/zksolc \
-    && chmod +x /etc/zksolc-bin/v1.3.10/zksolc
-RUN mkdir -p /etc/zksolc-bin/v1.3.11 \
-    && wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.11 \
-    && mv zksolc-linux-amd64-musl-v1.3.11 /etc/zksolc-bin/v1.3.11/zksolc \
-    && chmod +x /etc/zksolc-bin/v1.3.11/zksolc
-RUN mkdir -p /etc/zksolc-bin/v1.3.13 \
-    && wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.13 \
-    && mv zksolc-linux-amd64-musl-v1.3.13 /etc/zksolc-bin/v1.3.13/zksolc \
-    && chmod +x /etc/zksolc-bin/v1.3.13/zksolc
-RUN mkdir -p /etc/zksolc-bin/v1.3.14 \
-    && wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-v1.3.14 \
-    && mv zksolc-linux-amd64-musl-v1.3.14 /etc/zksolc-bin/v1.3.14/zksolc \
-    && chmod +x /etc/zksolc-bin/v1.3.14/zksolc
+FROM ghcr.io/matter-labs/zksync-runtime-base:latest
 
-# install zkvyper
-RUN mkdir -p /etc/zkvyper-bin/v1.3.9 \
-    && wget https://github.com/matter-labs/zkvyper-bin/raw/main/linux-amd64/zkvyper-linux-amd64-musl-v1.3.9 \
-    && mv zkvyper-linux-amd64-musl-v1.3.9 /etc/zkvyper-bin/v1.3.9/zkvyper \
-    && chmod +x /etc/zkvyper-bin/v1.3.9/zkvyper
-RUN mkdir -p /etc/zkvyper-bin/v1.3.10 \
-    && wget https://github.com/matter-labs/zkvyper-bin/raw/main/linux-amd64/zkvyper-linux-amd64-musl-v1.3.10 \
-    && mv zkvyper-linux-amd64-musl-v1.3.10 /etc/zkvyper-bin/v1.3.10/zkvyper \
-    && chmod +x /etc/zkvyper-bin/v1.3.10/zkvyper
+RUN apt-get update && apt-get install -y wget python3 jq && rm -rf /var/lib/apt/lists/*
+
+# install zksolc 1.3.x
+RUN skip_versions="v1.3.12 v1.3.15 v1.3.20" && \
+    for VERSION in $(seq -f "v1.3.%g" 0 23); do \
+    if echo " $skip_versions " | grep -q -w " $VERSION "; then \
+    continue; \
+    fi; \
+    mkdir -p /etc/zksolc-bin/$VERSION && \
+    wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-$VERSION -O /etc/zksolc-bin/$VERSION/zksolc && \
+    chmod +x /etc/zksolc-bin/$VERSION/zksolc; \
+    done
+
+# install zksolc 1.4.x
+RUN for VERSION in $(seq -f "v1.4.%g" 0 1); do \
+    mkdir -p /etc/zksolc-bin/$VERSION && \
+    wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-$VERSION -O /etc/zksolc-bin/$VERSION/zksolc && \
+    chmod +x /etc/zksolc-bin/$VERSION/zksolc; \
+    done
+
+# install zksolc vm1.5.0
+RUN mkdir -p /etc/zksolc-bin/vm-1.5.0-a167aa3 && \
+    wget https://github.com/matter-labs/era-compiler-solidity/releases/download/prerelease-a167aa3-code4rena/zksolc-linux-amd64-musl-v1.5.0 -O /etc/zksolc-bin/vm-1.5.0-a167aa3/zksolc && \
+    chmod +x /etc/zksolc-bin/vm-1.5.0-a167aa3/zksolc
+
+# install zksolc 1.5.x
+RUN for VERSION in $(seq -f "v1.5.%g" 0 7); do \
+    mkdir -p /etc/zksolc-bin/$VERSION && \
+    wget https://github.com/matter-labs/zksolc-bin/raw/main/linux-amd64/zksolc-linux-amd64-musl-$VERSION -O /etc/zksolc-bin/$VERSION/zksolc && \
+    chmod +x /etc/zksolc-bin/$VERSION/zksolc; \
+    done
+
+# install zkvyper 1.3.x
+RUN for VERSION in $(seq -f "v1.3.%g" 9 17); do \
+    mkdir -p /etc/zkvyper-bin/$VERSION && \
+    wget https://github.com/matter-labs/zkvyper-bin/raw/main/linux-amd64/zkvyper-linux-amd64-musl-$VERSION -O /etc/zkvyper-bin/$VERSION/zkvyper && \
+    chmod +x /etc/zkvyper-bin/$VERSION/zkvyper; \
+    done
+
+# install zkvyper 1.4.x
+RUN for VERSION in $(seq -f "v1.4.%g" 0 1); do \
+    mkdir -p /etc/zkvyper-bin/$VERSION && \
+    wget https://github.com/matter-labs/zkvyper-bin/raw/main/linux-amd64/zkvyper-linux-amd64-musl-$VERSION -O /etc/zkvyper-bin/$VERSION/zkvyper && \
+    chmod +x /etc/zkvyper-bin/$VERSION/zkvyper; \
+    done
+
+# install zkvyper 1.5.x
+RUN for VERSION in $(seq -f "v1.5.%g" 0 7); do \
+    mkdir -p /etc/zkvyper-bin/$VERSION && \
+    wget https://github.com/matter-labs/zkvyper-bin/raw/main/linux-amd64/zkvyper-linux-amd64-musl-$VERSION -O /etc/zkvyper-bin/$VERSION/zkvyper && \
+    chmod +x /etc/zkvyper-bin/$VERSION/zkvyper; \
+    done
 
 # install solc
 COPY docker/contract-verifier/install-all-solc.sh install-all-solc.sh
-RUN sh ./install-all-solc.sh
+RUN bash ./install-all-solc.sh
 
 # install vyper
 RUN mkdir -p /etc/vyper-bin/0.3.3 \
@@ -91,9 +87,17 @@ RUN mkdir -p /etc/vyper-bin/0.3.9 \
     && wget -O vyper0.3.9 https://github.com/vyperlang/vyper/releases/download/v0.3.9/vyper.0.3.9%2Bcommit.66b96705.linux \
     && mv vyper0.3.9 /etc/vyper-bin/0.3.9/vyper \
     && chmod +x /etc/vyper-bin/0.3.9/vyper
+RUN mkdir -p /etc/vyper-bin/0.3.10 \
+    && wget -O vyper0.3.10 https://github.com/vyperlang/vyper/releases/download/v0.3.10/vyper.0.3.10%2Bcommit.91361694.linux \
+    && mv vyper0.3.10 /etc/vyper-bin/0.3.10/vyper \
+    && chmod +x /etc/vyper-bin/0.3.10/vyper
+RUN mkdir -p /etc/vyper-bin/0.4.0 \
+    && wget -O vyper0.4.0 https://github.com/vyperlang/vyper/releases/download/v0.4.0/vyper.0.4.0+commit.e9db8d9f.linux \
+    && mv vyper0.4.0 /etc/vyper-bin/0.4.0/vyper \
+    && chmod +x /etc/vyper-bin/0.4.0/vyper
 
-COPY --from=builder /usr/src/zksync/target/release/zksync_contract_verifier /usr/bin/
-COPY etc/system-contracts/bootloader/build/artifacts/ /etc/system-contracts/bootloader/build/artifacts/
-COPY etc/system-contracts/artifacts-zk /etc/system-contracts/artifacts-zk
+COPY --from=builder /usr/src/zksync/core/target/release/zksync_contract_verifier /usr/bin/
+COPY contracts/system-contracts/zkout/ /contracts/system-contracts/zkout/
+
 # CMD tail -f /dev/null
 ENTRYPOINT ["zksync_contract_verifier"]

@@ -1,5 +1,5 @@
 import { Command } from 'commander';
-import * as utils from './utils';
+import * as utils from 'utils';
 
 // Note that `rust` is not noted here, as clippy isn't run via `yarn`.
 // `rust` option is still supported though.
@@ -8,19 +8,11 @@ const LINT_COMMANDS = {
     sol: 'solhint',
     js: 'eslint',
     ts: 'eslint --ext ts'
-    // This is needed to silence typescipt. It is possible to create type
-    // guards, but unfortunately they would have rather weird type, so
-    // Record<string, string> is a better solution.
-} as Record<string, string>;
-const EXTENSIONS = Object.keys(LINT_COMMANDS);
+};
+const EXTENSIONS = Object.keys(LINT_COMMANDS) as (keyof typeof LINT_COMMANDS)[];
 const CONFIG_PATH = 'etc/lint-config';
 
-export async function lint(extension: string, check: boolean = false) {
-    if (extension == 'rust') {
-        await clippy();
-        return;
-    }
-
+export async function lint(extension: keyof typeof LINT_COMMANDS, check: boolean = false) {
     if (!EXTENSIONS.includes(extension)) {
         throw new Error('Unsupported extension');
     }
@@ -32,23 +24,55 @@ export async function lint(extension: string, check: boolean = false) {
     await utils.spawn(`yarn --silent ${command} ${fixOption} --config ${CONFIG_PATH}/${extension}.js ${files}`);
 }
 
-async function clippy() {
-    process.chdir(process.env.ZKSYNC_HOME as string);
-    await utils.spawn('cargo clippy --tests -- -D warnings');
+async function lintContracts(check: boolean = false) {
+    await utils.spawn(`yarn --silent --cwd contracts lint:${check ? 'check' : 'fix'}`);
 }
 
-export const command = new Command('lint')
-    .description('lint non-rust code')
-    .option('--check')
-    .arguments('[extension]')
-    .action(async (extension: string | null, cmd: Command) => {
-        if (extension) {
-            await lint(extension, cmd.check);
-        } else {
-            for (const ext of EXTENSIONS) {
-                await lint(ext, cmd.check);
-            }
+async function clippy() {
+    process.chdir(process.env.ZKSYNC_HOME!);
+    await utils.spawn('cargo clippy --tests --locked -- -D warnings -D unstable_features');
+}
 
-            await clippy();
+async function proverClippy() {
+    process.chdir(`${process.env.ZKSYNC_HOME}/prover`);
+    await utils.spawn('cargo clippy --tests --locked -- -D warnings');
+}
+
+async function zkstackClippy() {
+    process.chdir(`${process.env.ZKSYNC_HOME}/zkstack_cli`);
+    await utils.spawn('cargo clippy --tests --locked -- -D warnings');
+}
+
+const ARGS = [...EXTENSIONS, 'rust', 'prover', 'contracts', 'zkstack_cli'] as const;
+
+export const command = new Command('lint')
+    .description('lint code')
+    .option('--check')
+    .arguments(`[extension] ${ARGS.join('|')}`)
+    .action(async (extension: (typeof ARGS)[number] | null, cmd: Command) => {
+        if (extension) {
+            switch (extension) {
+                case 'rust':
+                    await clippy();
+                    break;
+                case 'prover':
+                    await proverClippy();
+                    break;
+                case 'contracts':
+                    await lintContracts(cmd.check);
+                    break;
+                case 'zkstack_cli':
+                    await zkstackClippy();
+                    break;
+                default:
+                    await lint(extension, cmd.check);
+            }
+        } else {
+            const promises = EXTENSIONS.map((ext) => lint(ext, cmd.check));
+            promises.push(lintContracts(cmd.check));
+            promises.push(clippy());
+            promises.push(proverClippy());
+            promises.push(zkstackClippy());
+            await Promise.all(promises);
         }
     });

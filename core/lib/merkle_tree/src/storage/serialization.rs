@@ -1,11 +1,12 @@
 //! Serialization of node types in the database.
 
-use std::str;
+use std::{collections::HashMap, str};
 
 use crate::{
     errors::{DeserializeError, DeserializeErrorKind, ErrorContext},
+    repair::StaleKeysRepairData,
     types::{
-        ChildRef, InternalNode, Key, LeafNode, Manifest, Node, Root, TreeTags, ValueHash,
+        ChildRef, InternalNode, Key, LeafNode, Manifest, Node, RawNode, Root, TreeTags, ValueHash,
         HASH_SIZE, KEY_SIZE,
     },
 };
@@ -15,7 +16,7 @@ use crate::{
 const LEB128_SIZE_ESTIMATE: usize = 3;
 
 impl LeafNode {
-    pub(super) fn deserialize(bytes: &[u8]) -> Result<Self, DeserializeError> {
+    pub(super) fn deserialize(bytes: &[u8], strict: bool) -> Result<Self, DeserializeError> {
         if bytes.len() < KEY_SIZE + HASH_SIZE {
             return Err(DeserializeErrorKind::UnexpectedEof.into());
         }
@@ -26,7 +27,15 @@ impl LeafNode {
         let leaf_index = leb128::read::unsigned(&mut bytes).map_err(|err| {
             DeserializeErrorKind::Leb128(err).with_context(ErrorContext::LeafIndex)
         })?;
-        Ok(Self::new(full_key, value_hash, leaf_index))
+        if strict && !bytes.is_empty() {
+            return Err(DeserializeErrorKind::Leftovers.into());
+        }
+
+        Ok(Self {
+            full_key,
+            value_hash,
+            leaf_index,
+        })
     }
 
     pub(super) fn serialize(&self, buffer: &mut Vec<u8>) {
@@ -101,7 +110,7 @@ impl ChildRef {
 }
 
 impl InternalNode {
-    pub(super) fn deserialize(bytes: &[u8]) -> Result<Self, DeserializeError> {
+    pub(super) fn deserialize(bytes: &[u8], strict: bool) -> Result<Self, DeserializeError> {
         if bytes.len() < 4 {
             let err = DeserializeErrorKind::UnexpectedEof;
             return Err(err.with_context(ErrorContext::ChildrenMask));
@@ -130,6 +139,9 @@ impl InternalNode {
             }
             bitmap >>= 2;
         }
+        if strict && !bytes.is_empty() {
+            return Err(DeserializeErrorKind::Leftovers.into());
+        }
         Ok(this)
     }
 
@@ -157,15 +169,50 @@ impl InternalNode {
     }
 }
 
+impl RawNode {
+    pub(crate) fn deserialize(bytes: &[u8]) -> Self {
+        Self {
+            raw: bytes.to_vec(),
+            leaf: LeafNode::deserialize(bytes, true).ok(),
+            internal: InternalNode::deserialize(bytes, true).ok(),
+        }
+    }
+
+    pub(crate) fn deserialize_root(bytes: &[u8]) -> Self {
+        let root = Root::deserialize(bytes, true).ok();
+        let node = root.and_then(|root| match root {
+            Root::Empty => None,
+            Root::Filled { node, .. } => Some(node),
+        });
+        let (leaf, internal) = match node {
+            None => (None, None),
+            Some(Node::Leaf(leaf)) => (Some(leaf), None),
+            Some(Node::Internal(node)) => (None, Some(node)),
+        };
+        Self {
+            raw: bytes.to_vec(),
+            leaf,
+            internal,
+        }
+    }
+}
+
 impl Root {
-    pub(super) fn deserialize(mut bytes: &[u8]) -> Result<Self, DeserializeError> {
+    pub(super) fn deserialize(mut bytes: &[u8], strict: bool) -> Result<Self, DeserializeError> {
         let leaf_count = leb128::read::unsigned(&mut bytes).map_err(|err| {
             DeserializeErrorKind::Leb128(err).with_context(ErrorContext::LeafCount)
         })?;
         let node = match leaf_count {
             0 => return Ok(Self::Empty),
-            1 => Node::Leaf(LeafNode::deserialize(bytes)?),
-            _ => Node::Internal(InternalNode::deserialize(bytes)?),
+            1 => {
+                // Try both the leaf and internal node serialization; in some cases, a single leaf
+                // may still be persisted as an internal node. Since serialization of an internal node with a single child
+                // is always shorter than that a leaf, the order (first leaf, then internal node) is chosen intentionally.
+                LeafNode::deserialize(bytes, strict)
+                    .map(Node::Leaf)
+                    .or_else(|_| InternalNode::deserialize(bytes, strict).map(Node::Internal))?
+            }
+            _ => Node::Internal(InternalNode::deserialize(bytes, strict)?),
         };
         Ok(Self::new(leaf_count, node))
     }
@@ -195,11 +242,14 @@ impl Node {
 impl TreeTags {
     /// Tags are serialized as a length-prefixed list of `(&str, &str)` tuples, where each
     /// `&str` is length-prefixed as well. All lengths are encoded using LEB128.
+    /// Custom tag keys are prefixed with `custom.` to ensure they don't intersect with standard tags.
     fn deserialize(bytes: &mut &[u8]) -> Result<Self, DeserializeError> {
         let tag_count = leb128::read::unsigned(bytes).map_err(DeserializeErrorKind::Leb128)?;
         let mut architecture = None;
         let mut hasher = None;
         let mut depth = None;
+        let mut is_recovering = false;
+        let mut custom = HashMap::new();
 
         for _ in 0..tag_count {
             let key = Self::deserialize_str(bytes)?;
@@ -216,13 +266,30 @@ impl TreeTags {
                     })?;
                     depth = Some(parsed);
                 }
-                _ => return Err(DeserializeErrorKind::UnknownTag(key.to_owned()).into()),
+                "is_recovering" => {
+                    let parsed = value.parse::<bool>().map_err(|err| {
+                        DeserializeErrorKind::MalformedTag {
+                            name: "is_recovering",
+                            err: err.into(),
+                        }
+                    })?;
+                    is_recovering = parsed;
+                }
+                key => {
+                    if let Some(custom_key) = key.strip_prefix("custom.") {
+                        custom.insert(custom_key.to_owned(), value.to_owned());
+                    } else {
+                        return Err(DeserializeErrorKind::UnknownTag(key.to_owned()).into());
+                    }
+                }
             }
         }
         Ok(Self {
             architecture: architecture.ok_or(DeserializeErrorKind::MissingTag("architecture"))?,
             hasher: hasher.ok_or(DeserializeErrorKind::MissingTag("hasher"))?,
             depth: depth.ok_or(DeserializeErrorKind::MissingTag("depth"))?,
+            is_recovering,
+            custom,
         })
     }
 
@@ -244,13 +311,24 @@ impl TreeTags {
     }
 
     fn serialize(&self, buffer: &mut Vec<u8>) {
-        leb128::write::unsigned(buffer, 3).unwrap();
+        let entry_count = 3 + u64::from(self.is_recovering) + self.custom.len() as u64;
+        leb128::write::unsigned(buffer, entry_count).unwrap();
+
         Self::serialize_str(buffer, "architecture");
         Self::serialize_str(buffer, &self.architecture);
         Self::serialize_str(buffer, "depth");
         Self::serialize_str(buffer, &self.depth.to_string());
         Self::serialize_str(buffer, "hasher");
         Self::serialize_str(buffer, &self.hasher);
+        if self.is_recovering {
+            Self::serialize_str(buffer, "is_recovering");
+            Self::serialize_str(buffer, "true");
+        }
+
+        for (custom_key, value) in &self.custom {
+            Self::serialize_str(buffer, &format!("custom.{custom_key}"));
+            Self::serialize_str(buffer, value);
+        }
     }
 }
 
@@ -278,10 +356,24 @@ impl Manifest {
     }
 }
 
+impl StaleKeysRepairData {
+    pub(super) fn deserialize(mut bytes: &[u8]) -> Result<Self, DeserializeError> {
+        let next_version =
+            leb128::read::unsigned(&mut bytes).map_err(DeserializeErrorKind::Leb128)?;
+        Ok(Self { next_version })
+    }
+
+    pub(super) fn serialize(&self, buffer: &mut Vec<u8>) {
+        leb128::write::unsigned(buffer, self.next_version).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use zksync_types::H256;
+
+    use super::*;
+    use crate::types::TreeEntry;
 
     #[test]
     fn serializing_manifest() {
@@ -295,6 +387,58 @@ mod tests {
             *b"\x0Carchitecture\x06AR16MT\x05depth\x03256\x06hasher\x08no_op256"
         );
         // ^ length-prefixed tag names and values
+
+        let manifest_copy = Manifest::deserialize(&buffer).unwrap();
+        assert_eq!(manifest_copy, manifest);
+    }
+
+    #[test]
+    fn serializing_manifest_with_recovery_flag() {
+        let mut manifest = Manifest::new(42, &());
+        manifest.tags.as_mut().unwrap().is_recovering = true;
+        let mut buffer = vec![];
+        manifest.serialize(&mut buffer);
+        assert_eq!(buffer[0], 42); // version count
+        assert_eq!(buffer[1], 4); // number of tags
+        assert_eq!(
+            buffer[2..],
+            *b"\x0Carchitecture\x06AR16MT\x05depth\x03256\x06hasher\x08no_op256\x0Dis_recovering\x04true"
+        );
+        // ^ length-prefixed tag names and values
+
+        let manifest_copy = Manifest::deserialize(&buffer).unwrap();
+        assert_eq!(manifest_copy, manifest);
+    }
+
+    #[test]
+    fn serializing_manifest_with_custom_tags() {
+        let mut manifest = Manifest::new(42, &());
+        // Test a single custom tag first to not deal with non-determinism when enumerating tags.
+        manifest.tags.as_mut().unwrap().custom =
+            HashMap::from([("test".to_owned(), "1".to_owned())]);
+        let mut buffer = vec![];
+        manifest.serialize(&mut buffer);
+        assert_eq!(buffer[0], 42); // version count
+        assert_eq!(buffer[1], 4); // number of tags (3 standard + 1 custom)
+        assert_eq!(
+            buffer[2..],
+            *b"\x0Carchitecture\x06AR16MT\x05depth\x03256\x06hasher\x08no_op256\x0Bcustom.test\x011"
+        );
+
+        let manifest_copy = Manifest::deserialize(&buffer).unwrap();
+        assert_eq!(manifest_copy, manifest);
+
+        // Test multiple tags.
+        let tags = manifest.tags.as_mut().unwrap();
+        tags.is_recovering = true;
+        tags.custom = HashMap::from([
+            ("test".to_owned(), "1".to_owned()),
+            ("other.long.tag".to_owned(), "123456!!!".to_owned()),
+        ]);
+        let mut buffer = vec![];
+        manifest.serialize(&mut buffer);
+        assert_eq!(buffer[0], 42); // version count
+        assert_eq!(buffer[1], 6); // number of tags (4 standard + 2 custom)
 
         let manifest_copy = Manifest::deserialize(&buffer).unwrap();
         assert_eq!(manifest_copy, manifest);
@@ -335,7 +479,7 @@ mod tests {
 
     #[test]
     fn serializing_leaf_node() {
-        let leaf = LeafNode::new(513.into(), H256([4; 32]), 42);
+        let leaf = LeafNode::new(TreeEntry::new(513.into(), 42, H256([4; 32])));
         let mut buffer = vec![];
         leaf.serialize(&mut buffer);
         assert_eq!(buffer[..30], [0; 30]); // padding for the key
@@ -344,7 +488,7 @@ mod tests {
         assert_eq!(buffer[64], 42); // leaf index
         assert_eq!(buffer.len(), 65);
 
-        let leaf_copy = LeafNode::deserialize(&buffer).unwrap();
+        let leaf_copy = LeafNode::deserialize(&buffer, true).unwrap();
         assert_eq!(leaf_copy, leaf);
     }
 
@@ -375,7 +519,7 @@ mod tests {
         let child_count = bitmap.count_ones();
         assert_eq!(child_count, 2);
 
-        let node_copy = InternalNode::deserialize(&buffer).unwrap();
+        let node_copy = InternalNode::deserialize(&buffer, true).unwrap();
         assert_eq!(node_copy, node);
     }
 
@@ -386,19 +530,19 @@ mod tests {
         root.serialize(&mut buffer);
         assert_eq!(buffer, [0]);
 
-        let root_copy = Root::deserialize(&buffer).unwrap();
+        let root_copy = Root::deserialize(&buffer, true).unwrap();
         assert_eq!(root_copy, root);
     }
 
     #[test]
     fn serializing_root_with_leaf() {
-        let leaf = LeafNode::new(513.into(), H256([4; 32]), 42);
+        let leaf = LeafNode::new(TreeEntry::new(513.into(), 42, H256([4; 32])));
         let root = Root::new(1, leaf.into());
         let mut buffer = vec![];
         root.serialize(&mut buffer);
         assert_eq!(buffer[0], 1);
 
-        let root_copy = Root::deserialize(&buffer).unwrap();
+        let root_copy = Root::deserialize(&buffer, true).unwrap();
         assert_eq!(root_copy, root);
     }
 
@@ -410,7 +554,7 @@ mod tests {
         root.serialize(&mut buffer);
         assert_eq!(buffer[0], 2);
 
-        let root_copy = Root::deserialize(&buffer).unwrap();
+        let root_copy = Root::deserialize(&buffer, true).unwrap();
         assert_eq!(root_copy, root);
     }
 }
